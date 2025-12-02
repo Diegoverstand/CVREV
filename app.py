@@ -223,47 +223,86 @@ with tab_dash:
     else:
         st.info("⚠️ El Dashboard está vacío. Ve a la pestaña 'Procesamiento IA' y carga CVs para ver las analíticas.")
 
-# --- TAB 2: PROCESAMIENTO ---
+# --- TAB 2: PROCESAMIENTO (CÓDIGO MEJORADO) ---
 with tab_proc:
+    st.markdown("### ⚡ Centro de Procesamiento")
     col_input, col_conf = st.columns([3, 1])
-    with col_input:
-        files = st.file_uploader("Cargar Nuevos CVs", accept_multiple_files=True, type=['pdf','docx'])
-    with col_conf:
-        sel_fac = st.selectbox("Facultad Destino", ["Ingeniería", "Economía", "Ciencias Vida", "Educación"])
-        sel_rol = st.selectbox("Cargo Evaluado", ["Docente", "Investigador", "Gestión Académica"])
     
+    with col_input:
+        files = st.file_uploader("1. Arrastra los CVs aquí (PDF/Word)", accept_multiple_files=True, type=['pdf','docx'])
+    
+    with col_conf:
+        st.write("2. Configura el Lote:")
+        sel_fac = st.selectbox("Facultad", ["Ingeniería", "Economía", "Ciencias Vida", "Educación"])
+        sel_rol = st.selectbox("Cargo", ["Docente", "Investigador", "Gestión Académica"])
+    
+    # Botón de acción
     if st.button("🚀 Ejecutar Análisis", type="primary"):
-        if files and api_key:
+        if not files:
+            st.warning("⚠️ Debes cargar al menos un archivo.")
+        elif not api_key:
+            st.error("❌ Falta la API Key en el menú lateral.")
+        else:
+            # Contenedor para mostrar el reporte en vivo
+            status_container = st.container()
             bar = st.progress(0)
-            for i, f in enumerate(files):
-                txt = read_file(f)
-                if len(txt) > 50:
-                    d = analyze_gemini(txt, sel_rol, sel_fac, api_key)
-                    if d:
-                        # Guardar Datos
-                        new_row = {
-                            "Fecha_Carga": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                            "Candidato": d['nombre'],
-                            "Facultad": sel_fac,
-                            "Cargo": sel_rol,
-                            "Puntaje_Final": d['final'],
-                            "Recomendación": d['rec'],
-                            "Ajuste": d['ajuste'],
-                            "Comentarios_Texto": d['comentarios'],
-                            "Nota_Formacion": d['n_form'],
-                            "Nota_Experiencia": d['n_exp'],
-                            "Nota_Competencias": d['n_comp'],
-                            "Nota_Software": d['n_soft']
-                        }
-                        st.session_state.history = pd.concat([st.session_state.history, pd.DataFrame([new_row])], ignore_index=True)
-                        
-                        # Generar PDF
-                        pdf_bytes = create_pdf(new_row)
-                        st.session_state.pdfs[f"{d['nombre']}_{int(time.time())}"] = pdf_bytes
+            success_count = 0
+            
+            with status_container:
+                st.write("Iniciando motor de IA...")
                 
-                bar.progress((i+1)/len(files))
-            st.success("Proceso completado. Revisa Dashboard y Base de Datos.")
-            st.rerun()
+                for i, f in enumerate(files):
+                    # Intentar leer
+                    txt = read_file(f)
+                    
+                    # Validar si tiene texto
+                    if len(txt) < 50:
+                        st.warning(f"⚠️ **{f.name}**: Archivo vacío o es una imagen escaneada. Se omitió.")
+                        continue
+                        
+                    # Intentar analizar con Gemini
+                    try:
+                        d = analyze_gemini(txt, sel_rol, sel_fac, api_key)
+                        
+                        if d:
+                            # Guardar en historial
+                            new_row = {
+                                "Fecha_Carga": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                "Candidato": d.get('nombre', 'Desconocido'),
+                                "Facultad": sel_fac,
+                                "Cargo": sel_rol,
+                                "Puntaje_Final": d.get('final', 0),
+                                "Recomendación": d.get('rec', 'N/A'),
+                                "Ajuste": d.get('ajuste', 'N/A'),
+                                "Comentarios_Texto": d.get('comentarios', ''),
+                                "Nota_Formacion": d.get('n_form', 0),
+                                "Nota_Experiencia": d.get('n_exp', 0),
+                                "Nota_Competencias": d.get('n_comp', 0),
+                                "Nota_Software": d.get('n_soft', 0)
+                            }
+                            st.session_state.history = pd.concat([st.session_state.history, pd.DataFrame([new_row])], ignore_index=True)
+                            
+                            # Generar PDF
+                            pdf_bytes = create_pdf(new_row)
+                            st.session_state.pdfs[f"{d['nombre']}_{int(time.time())}"] = pdf_bytes
+                            
+                            st.success(f"✅ **{f.name}**: Procesado correctamente (Nota: {new_row['Puntaje_Final']})")
+                            success_count += 1
+                        else:
+                            st.error(f"❌ **{f.name}**: La IA no pudo extraer datos válidos.")
+                            
+                    except Exception as e:
+                        st.error(f"❌ **{f.name}**: Error técnico ({str(e)})")
+                    
+                    # Actualizar barra
+                    bar.progress((i+1)/len(files))
+            
+            if success_count > 0:
+                st.balloons()
+                st.success(f"¡Listo! Se procesaron {success_count} CVs exitosamente.")
+                st.info("👉 Ve a la pestaña **'Dashboard Ejecutivo'** o **'Base de Datos'** para ver los resultados.")
+            else:
+                st.error("No se pudo procesar ningún CV correctamente.")
 
 # --- TAB 3: BASE DE DATOS ---
 with tab_db:
@@ -318,4 +357,5 @@ with tab_repo:
             col1.write(f"📄 Informe: {name}")
             col2.download_button("Descargar", content, f"{name}.pdf", key=name)
     else:
+
         st.info("Los PDFs generados aparecerán aquí.")
