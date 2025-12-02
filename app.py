@@ -106,42 +106,105 @@ def create_pdf(data):
     
     return pdf.output(dest='S').encode('latin-1')
 
-# --- 3. LÓGICA DE DATOS ---
-def read_file(file):
-    try:
-        if file.type == "application/pdf":
-            reader = PdfReader(file)
-            return "".join([p.extract_text() for p in reader.pages])
-        elif "word" in file.type:
-            doc = Document(file)
-            return "\n".join([p.text for p in doc.paragraphs])
-    except: return ""
-    return ""
+# --- 3. LÓGICA DE DATOS MEJORADA (REEMPLAZA ESTO EN TU CÓDIGO) ---
+import json
+import re
 
 def analyze_gemini(text, role, faculty, api_key):
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    crit = RUBRICA[role]
-    prompt = f"""
-    Evalúa CV para {role} en {faculty}. RÚBRICA: {crit}.
-    Output JSON STRICT:
-    {{
-        "nombre": "Nombre Apellido",
-        "ajuste": "Alto/Medio/Bajo",
-        "razon": "Frase resumen",
-        "rec": "Avanza/Dudoso/Descartado",
-        "n_form": 0.0, "n_exp": 0.0, "n_comp": 0.0, "n_soft": 0.0,
-        "comentarios": "Fortalezas, Debilidades y Riesgos."
-    }}
-    CV Text: {text[:12000]}
-    """
     try:
+        # Configuración del modelo
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        crit = RUBRICA[role]
+        
+        # Prompt reforzado para evitar errores de formato
+        prompt = f"""
+        Actúa como un reclutador experto. Analiza este CV (puede estar en inglés o español) para el cargo: {role} en la facultad: {faculty}.
+        
+        RÚBRICA DE EVALUACIÓN (0 a 5 ptos):
+        1. Formación: {crit['Formación']}
+        2. Experiencia: {crit['Experiencia']}
+        3. Competencias: {crit['Competencias']}
+        4. Software: {crit['Software']}
+
+        INSTRUCCIONES TÉCNICAS (CRÍTICO):
+        - Responde ÚNICAMENTE con un objeto JSON válido.
+        - NO uses bloques de código markdown (```json).
+        - NO incluyas texto antes ni después del JSON.
+        - Si el texto contiene comillas dobles ("), cámbialas por comillas simples (') para no romper el JSON.
+        
+        ESTRUCTURA JSON REQUERIDA:
+        {{
+            "nombre": "Nombre y Apellido",
+            "ajuste": "Alto/Medio/Bajo",
+            "razon": "Breve justificación del ajuste",
+            "rec": "Avanza/Dudoso/Descartado",
+            "n_form": 0.0, 
+            "n_exp": 0.0, 
+            "n_comp": 0.0, 
+            "n_soft": 0.0,
+            "comentarios": "Resumen de fortalezas y debilidades."
+        }}
+
+        CV A ANALIZAR: 
+        {text[:12000]}
+        """
+        
+        # Generar respuesta
         res = model.generate_content(prompt)
-        clean = res.text.replace("```json","").replace("```","").strip()
-        data = eval(clean)
-        final = (data['n_form']*0.35 + data['n_exp']*0.30 + data['n_comp']*0.20 + data['n_soft']*0.15)
-        return {**data, "final": round(final, 2)}
-    except: return None
+        raw_text = res.text
+        
+        # --- LIMPIEZA AVANZADA DE LA RESPUESTA ---
+        # 1. Encontrar dónde empieza y termina el JSON real
+        start_idx = raw_text.find('{')
+        end_idx = raw_text.rfind('}') + 1
+        
+        if start_idx == -1 or end_idx == 0:
+            return None # No se encontró estructura JSON
+
+        json_str = raw_text[start_idx:end_idx]
+        
+        # 2. Intentar parsear con librería oficial JSON
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError:
+            # Si falla, intentar limpieza agresiva (comas finales, saltos de linea)
+            # Esto corrige errores comunes de las IAs
+            try:
+                # Truco: eval de python es más permisivo que json estricto
+                data = eval(json_str) 
+            except:
+                return None
+
+        # 3. Calcular nota final asegurando que sean números (floats)
+        def safe_float(val):
+            try: return float(val)
+            except: return 0.0
+
+        final = (safe_float(data.get('n_form', 0))*0.35 + 
+                 safe_float(data.get('n_exp', 0))*0.30 + 
+                 safe_float(data.get('n_comp', 0))*0.20 + 
+                 safe_float(data.get('n_soft', 0))*0.15)
+        
+        # Retornar diccionario limpio con la nota calculada
+        return {
+            "nombre": data.get('nombre', 'Postulante'),
+            "ajuste": data.get('ajuste', 'N/A'),
+            "razon": data.get('razon', 'Sin razón'),
+            "rec": data.get('rec', 'Revisar'),
+            "n_form": safe_float(data.get('n_form', 0)),
+            "n_exp": safe_float(data.get('n_exp', 0)),
+            "n_comp": safe_float(data.get('n_comp', 0)),
+            "n_soft": safe_float(data.get('n_soft', 0)),
+            "comentarios": data.get('comentarios', 'Sin comentarios'),
+            "final": round(final, 2)
+        }
+
+    except Exception as e:
+        # Esto imprimirá el error real en la consola de Streamlit Cloud (logs) si falla
+        print(f"ERROR CRÍTICO EN ANALYZE_GEMINI: {e}")
+        return None
 
 # --- 4. INICIALIZACIÓN DE ESTADO ---
 if 'history' not in st.session_state:
@@ -359,3 +422,4 @@ with tab_repo:
     else:
 
         st.info("Los PDFs generados aparecerán aquí.")
+
