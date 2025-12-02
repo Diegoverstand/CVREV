@@ -11,9 +11,8 @@ import re
 from datetime import datetime
 from fpdf import FPDF
 import plotly.express as px
-import plotly.graph_objects as go
 
-# --- 1. CONFIGURACIÓN Y ESTILO CORPORATIVO ---
+# --- 1. CONFIGURACIÓN Y ESTILO CORPORATIVO (DARK MODE FRIENDLY) ---
 st.set_page_config(
     page_title="HR Intelligence Suite",
     layout="wide",
@@ -21,51 +20,67 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# CSS Profesional para UI Corporativa
+# CSS PROFESIONAL
 st.markdown("""
     <style>
-    /* Estilo General */
-    .main { background-color: #f8f9fa; }
-    h1, h2, h3 { font-family: 'Segoe UI', sans-serif; color: #2c3e50; }
+    /* Ajuste General para Modo Oscuro */
+    .main { background-color: #0E1117; }
     
-    /* Tarjetas de Métricas */
-    .metric-card {
-        background-color: white;
-        padding: 20px;
+    h1, h2, h3 {
+        font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+        color: #FAFAFA !important;
+        font-weight: 600;
+    }
+    
+    p, label { color: #E0E0E0 !important; }
+
+    /* TARJETAS DE LOTES */
+    .batch-card {
+        background-color: #262730;
         border-radius: 10px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        text-align: center;
-        border-left: 5px solid #3498db;
-    }
-    
-    /* Contenedores de Lotes */
-    .batch-container {
-        background-color: #ffffff;
-        border: 1px solid #e0e0e0;
-        border-radius: 8px;
         padding: 15px;
-        margin-bottom: 15px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        margin-bottom: 10px;
+        border: 1px solid #363945;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
     }
     
-    /* Botones */
+    /* Bordes de color */
+    .border-blue { border-top: 4px solid #3498db; }
+    .border-green { border-top: 4px solid #2ecc71; }
+    .border-orange { border-top: 4px solid #e67e22; }
+    .border-purple { border-top: 4px solid #9b59b6; }
+
+    .batch-card h4 {
+        margin-top: 0;
+        font-size: 1.1rem;
+        color: #ffffff !important;
+        border-bottom: 1px solid #444;
+        padding-bottom: 10px;
+        margin-bottom: 15px;
+    }
+
+    /* BOTONES */
     .stButton>button {
         width: 100%;
-        border-radius: 5px;
-        font-weight: bold;
+        border-radius: 6px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 1px;
     }
     
-    /* Tabs */
-    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    /* TABS */
+    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
     .stTabs [data-baseweb="tab"] {
         height: 50px;
-        background-color: #ffffff;
+        background-color: #262730;
         border-radius: 5px;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+        border: 1px solid #363945;
+        color: #cccccc;
     }
     .stTabs [aria-selected="true"] {
-        background-color: #2c3e50;
-        color: white;
+        background-color: #3498db !important;
+        color: white !important;
+        border-color: #3498db;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -92,10 +107,9 @@ RUBRICA = {
     }
 }
 
-# --- 3. FUNCIONES CORE (LECTURA Y ANÁLISIS) ---
+# --- 3. FUNCIONES CORE ---
 
 def read_file(file):
-    """Lectura robusta de archivos"""
     try:
         if file.type == "application/pdf":
             reader = PdfReader(file)
@@ -111,7 +125,6 @@ def read_file(file):
         return ""
 
 def analyze_gemini_safe(text, role, faculty, api_key):
-    """Motor de IA con blindaje contra errores de formato JSON"""
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-1.5-flash')
@@ -127,7 +140,7 @@ def analyze_gemini_safe(text, role, faculty, api_key):
         4. Software: {crit['Software']}
 
         INSTRUCCIÓN TÉCNICA:
-        Responde SOLO con un JSON válido. Sin markdown. Si hay comillas en el texto, usa simples.
+        Responde SOLO con un JSON válido. Sin markdown.
         
         JSON:
         {{
@@ -145,21 +158,17 @@ def analyze_gemini_safe(text, role, faculty, api_key):
         response = model.generate_content(prompt)
         raw = response.text
         
-        # Limpieza JSON
         start = raw.find('{')
         end = raw.rfind('}') + 1
         if start == -1 or end == 0: return None
-        
         json_str = raw[start:end]
         
         try:
             data = json.loads(json_str)
         except:
-            data = eval(json_str) # Fallback
+            data = eval(json_str) 
             
-        # Cálculos seguros
         def val(k): return float(data.get(k, 0))
-        
         final = val('n_form')*0.35 + val('n_exp')*0.30 + val('n_comp')*0.20 + val('n_soft')*0.15
         
         return {
@@ -189,11 +198,8 @@ class PDFReport(FPDF):
 def generate_pdf_bytes(data):
     pdf = PDFReport()
     pdf.add_page()
-    
-    # Función auxiliar para caracteres latinos
     def txt(s): return str(s).encode('latin-1', 'replace').decode('latin-1')
     
-    # Encabezado Candidato
     pdf.set_font('Arial', 'B', 16)
     pdf.cell(0, 10, txt(data.get('nombre', 'Candidato')), 0, 1)
     
@@ -202,8 +208,7 @@ def generate_pdf_bytes(data):
     pdf.cell(0, 8, txt(f"{data['facultad']} | {data['cargo']}"), 0, 1)
     pdf.ln(5)
     
-    # Caja de Resultado
-    pdf.set_fill_color(236, 240, 241) # Gris muy claro
+    pdf.set_fill_color(236, 240, 241) 
     pdf.rect(10, 50, 190, 30, 'F')
     
     pdf.set_xy(15, 55)
@@ -211,7 +216,6 @@ def generate_pdf_bytes(data):
     pdf.set_text_color(0)
     pdf.cell(90, 10, f"Puntaje Global: {data['final']} / 5.0")
     
-    # Color condicional texto recomendación
     rec = data.get('rec', '')
     pdf.cell(0, 10, txt(f"Decisión: {rec}"), 0, 1)
     
@@ -221,9 +225,8 @@ def generate_pdf_bytes(data):
     
     pdf.ln(25)
     
-    # Tabla Detalle
     pdf.set_font('Arial', 'B', 10)
-    pdf.set_fill_color(52, 152, 219) # Azul corporativo
+    pdf.set_fill_color(52, 152, 219) 
     pdf.set_text_color(255)
     pdf.cell(140, 8, "Dimensión Evaluada", 1, 0, 'L', True)
     pdf.cell(50, 8, "Puntaje", 1, 1, 'C', True)
@@ -250,156 +253,228 @@ def generate_pdf_bytes(data):
     
     return pdf.output(dest='S').encode('latin-1')
 
-# --- 5. GESTIÓN DE ESTADO (MEMORIA) ---
+# --- 5. LÓGICA DE PROCESAMIENTO REUTILIZABLE ---
+def process_cvs(file_list, faculty, role, api_key):
+    """Procesa una lista de archivos y devuelve el número de éxitos"""
+    count = 0
+    for f in file_list:
+        text = read_file(f)
+        if len(text) > 50:
+            res = analyze_gemini_safe(text, role, faculty, api_key)
+            if res:
+                pdf_bytes = generate_pdf_bytes({**res, "facultad": faculty, "cargo": role})
+                new_entry = {
+                    "Fecha": res['timestamp'],
+                    "Candidato": res['nombre'],
+                    "Facultad": faculty,
+                    "Cargo": role,
+                    "Nota": res['final'],
+                    "Estado": res['rec'],
+                    "Ajuste": res['ajuste'],
+                    "Feedback": res['comentarios'],
+                    "n_form": res['n_form'],
+                    "n_exp": res['n_exp'],
+                    "n_comp": res['n_comp'],
+                    "n_soft": res['n_soft'],
+                    "PDF": pdf_bytes
+                }
+                st.session_state.db = pd.concat([st.session_state.db, pd.DataFrame([new_entry])], ignore_index=True)
+                count += 1
+    return count
+
+# --- 6. GESTIÓN DE ESTADO ---
 if 'db' not in st.session_state:
     st.session_state.db = pd.DataFrame(columns=['Fecha', 'Candidato', 'Facultad', 'Cargo', 'Nota', 'Estado', 'Ajuste', 'Feedback', 'PDF'])
 
-# --- 6. INTERFAZ PRINCIPAL ---
+# --- 7. INTERFAZ PRINCIPAL ---
 
 # Sidebar
 with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/9187/9187604.png", width=60)
+    st.image("https://cdn-icons-png.flaticon.com/512/9187/9187604.png", width=50)
     st.title("Admin Console")
     
-    # Gestión de API Key
     if 'GOOGLE_API_KEY' in st.secrets:
         api_key = st.secrets['GOOGLE_API_KEY']
         st.success("✅ Sistema Conectado")
     else:
         api_key = st.text_input("🔑 API Key", type="password")
-        if not api_key: st.warning("Ingrese clave para operar")
-
+    
     st.divider()
-    st.info("La sesión mantiene los datos mientras el navegador esté abierto.")
+    st.info("Sistema optimizado para grandes volúmenes de datos.")
 
-# Título Principal
+# Título
 st.markdown("## 🏢 HR Intelligence Suite: Evaluación Académica")
-st.markdown("Sistema centralizado de análisis curricular asistido por IA.")
 
-# Pestañas (CORREGIDO: Aquí definimos tab_repo correctamente)
+# Pestañas
 tab_load, tab_dash, tab_data, tab_repo = st.tabs([
-    "⚡ Centro de Procesamiento (Multi-Lote)", 
+    "⚡ Procesamiento (Multi-Lote)", 
     "📊 Dashboard Ejecutivo", 
     "🗃️ Base de Datos", 
     "📂 Repositorio PDF"
 ])
 
-# --- TAB 1: CARGA MULTI-LOTE (LA INNOVACIÓN) ---
+# --- TAB 1: CARGA MULTI-LOTE MEJORADA (ESTRUCTURA HÍBRIDA) ---
 with tab_load:
-    st.write("Configure hasta 4 lotes de carga simultánea para diferentes perfiles.")
+    st.markdown("### Configuración de Carga Simultánea")
+    st.markdown("Utilice los botones individuales para procesar lotes específicos, o el botón maestro para procesar todo.")
     
-    # Contenedor del Formulario
-    with st.form("batch_process_form"):
-        # Grid de 2x2 para los lotes
-        col1, col2 = st.columns(2)
-        
-        batches_data = []
-        
-        # Función para renderizar un "Card" de lote
-        def render_batch_slot(col, idx):
-            with col:
-                st.markdown(f"<div class='batch-container'><h4>📂 Lote de Carga #{idx}</h4>", unsafe_allow_html=True)
-                files = st.file_uploader(f"Seleccionar CVs", type=['pdf','docx'], key=f"u_{idx}", accept_multiple_files=True)
-                c_a, c_b = st.columns(2)
-                fac = c_a.selectbox(f"Facultad", ["Ingeniería", "Economía", "Ciencias Vida", "Educación"], key=f"f_{idx}")
-                rol = c_b.selectbox(f"Cargo", ["Docente", "Investigador", "Gestión Académica"], key=f"r_{idx}")
-                st.markdown("</div>", unsafe_allow_html=True)
-                return {"files": files, "fac": fac, "rol": rol}
+    # --- FILA 1 ---
+    col1, col2 = st.columns(2)
+    
+    # LOTE 1 (AZUL)
+    with col1:
+        st.markdown('<div class="batch-card border-blue"><h4>📂 Lote #1</h4></div>', unsafe_allow_html=True)
+        files1 = st.file_uploader("Archivos Lote 1", type=['pdf','docx'], key="u_1", accept_multiple_files=True, label_visibility="collapsed")
+        c1a, c1b = st.columns(2)
+        fac1 = c1a.selectbox("Facultad", ["Ingeniería", "Economía", "Ciencias Vida", "Educación"], key="f_1")
+        rol1 = c1b.selectbox("Cargo", ["Docente", "Investigador", "Gestión Académica"], key="r_1")
+        if st.button("Procesar Lote 1", key="btn_1"):
+            if files1 and api_key:
+                with st.spinner("Analizando Lote 1..."):
+                    n = process_cvs(files1, fac1, rol1, api_key)
+                    st.success(f"✅ Lote 1: {n} procesados.")
+                    time.sleep(1)
+                    st.rerun()
 
-        # Renderizar los 4 lotes
-        b1 = render_batch_slot(col1, 1)
-        b2 = render_batch_slot(col2, 2)
-        b3 = render_batch_slot(col1, 3)
-        b4 = render_batch_slot(col2, 4)
-        
-        # Botón Maestro
-        st.markdown("---")
-        submit_btn = st.form_submit_button("🚀 INICIAR PROCESAMIENTO MASIVO", type="primary")
+    # LOTE 2 (VERDE)
+    with col2:
+        st.markdown('<div class="batch-card border-green"><h4>📂 Lote #2</h4></div>', unsafe_allow_html=True)
+        files2 = st.file_uploader("Archivos Lote 2", type=['pdf','docx'], key="u_2", accept_multiple_files=True, label_visibility="collapsed")
+        c2a, c2b = st.columns(2)
+        fac2 = c2a.selectbox("Facultad", ["Ingeniería", "Economía", "Ciencias Vida", "Educación"], key="f_2")
+        rol2 = c2b.selectbox("Cargo", ["Docente", "Investigador", "Gestión Académica"], key="r_2")
+        if st.button("Procesar Lote 2", key="btn_2"):
+            if files2 and api_key:
+                with st.spinner("Analizando Lote 2..."):
+                    n = process_cvs(files2, fac2, rol2, api_key)
+                    st.success(f"✅ Lote 2: {n} procesados.")
+                    time.sleep(1)
+                    st.rerun()
 
-    # Lógica de Procesamiento
-    if submit_btn and api_key:
-        active_batches = [b for b in [b1, b2, b3, b4] if b['files']]
-        
-        if not active_batches:
-            st.warning("⚠️ Cargue archivos en al menos un lote para comenzar.")
+    # --- FILA 2 ---
+    col3, col4 = st.columns(2)
+
+    # LOTE 3 (NARANJA)
+    with col3:
+        st.markdown('<div class="batch-card border-orange"><h4>📂 Lote #3</h4></div>', unsafe_allow_html=True)
+        files3 = st.file_uploader("Archivos Lote 3", type=['pdf','docx'], key="u_3", accept_multiple_files=True, label_visibility="collapsed")
+        c3a, c3b = st.columns(2)
+        fac3 = c3a.selectbox("Facultad", ["Ingeniería", "Economía", "Ciencias Vida", "Educación"], key="f_3")
+        rol3 = c3b.selectbox("Cargo", ["Docente", "Investigador", "Gestión Académica"], key="r_3")
+        if st.button("Procesar Lote 3", key="btn_3"):
+            if files3 and api_key:
+                with st.spinner("Analizando Lote 3..."):
+                    n = process_cvs(files3, fac3, rol3, api_key)
+                    st.success(f"✅ Lote 3: {n} procesados.")
+                    time.sleep(1)
+                    st.rerun()
+
+    # LOTE 4 (PURPURA)
+    with col4:
+        st.markdown('<div class="batch-card border-purple"><h4>📂 Lote #4</h4></div>', unsafe_allow_html=True)
+        files4 = st.file_uploader("Archivos Lote 4", type=['pdf','docx'], key="u_4", accept_multiple_files=True, label_visibility="collapsed")
+        c4a, c4b = st.columns(2)
+        fac4 = c4a.selectbox("Facultad", ["Ingeniería", "Economía", "Ciencias Vida", "Educación"], key="f_4")
+        rol4 = c4b.selectbox("Cargo", ["Docente", "Investigador", "Gestión Académica"], key="r_4")
+        if st.button("Procesar Lote 4", key="btn_4"):
+            if files4 and api_key:
+                with st.spinner("Analizando Lote 4..."):
+                    n = process_cvs(files4, fac4, rol4, api_key)
+                    st.success(f"✅ Lote 4: {n} procesados.")
+                    time.sleep(1)
+                    st.rerun()
+
+    # --- BOTÓN MAESTRO ---
+    st.markdown("---")
+    st.markdown("### Acciones Globales")
+    
+    if st.button("🚀 PROCESAMIENTO MASIVO (TODOS LOS LOTES ACTIVOS)", type="primary"):
+        if not api_key:
+            st.error("🔑 Ingrese API Key")
         else:
-            total_files = sum([len(b['files']) for b in active_batches])
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            processed_count = 0
+            total_processed = 0
+            bar = st.progress(0)
+            status = st.empty()
             
-            for b_idx, batch in enumerate(active_batches):
-                current_fac = batch['fac']
-                current_rol = batch['rol']
+            # Recopilar lotes activos
+            batches = [
+                (files1, fac1, rol1),
+                (files2, fac2, rol2),
+                (files3, fac3, rol3),
+                (files4, fac4, rol4)
+            ]
+            
+            # Filtrar vacíos
+            active_batches = [b for b in batches if b[0]]
+            
+            if not active_batches:
+                st.warning("⚠️ No hay archivos cargados en ningún lote.")
+            else:
+                total_files_global = sum([len(b[0]) for b in active_batches])
+                current_count = 0
                 
-                for f in batch['files']:
-                    status_text.markdown(f"**Analizando:** {f.name} ({current_fac} - {current_rol})...")
-                    
-                    text = read_file(f)
-                    if len(text) > 50:
-                        res = analyze_gemini_safe(text, current_rol, current_fac, api_key)
+                for files, fac, rol in active_batches:
+                    for f in files:
+                        status.markdown(f"**Procesando:** {f.name}...")
+                        text = read_file(f)
+                        if len(text) > 50:
+                            res = analyze_gemini_safe(text, rol, fac, api_key)
+                            if res:
+                                pdf_bytes = generate_pdf_bytes({**res, "facultad": fac, "cargo": rol})
+                                new_entry = {
+                                    "Fecha": res['timestamp'],
+                                    "Candidato": res['nombre'],
+                                    "Facultad": fac,
+                                    "Cargo": rol,
+                                    "Nota": res['final'],
+                                    "Estado": res['rec'],
+                                    "Ajuste": res['ajuste'],
+                                    "Feedback": res['comentarios'],
+                                    "n_form": res['n_form'],
+                                    "n_exp": res['n_exp'],
+                                    "n_comp": res['n_comp'],
+                                    "n_soft": res['n_soft'],
+                                    "PDF": pdf_bytes
+                                }
+                                st.session_state.db = pd.concat([st.session_state.db, pd.DataFrame([new_entry])], ignore_index=True)
+                                total_processed += 1
                         
-                        if res:
-                            # Preparar registro
-                            pdf_bytes = generate_pdf_bytes({**res, "facultad": current_fac, "cargo": current_rol})
-                            
-                            new_entry = {
-                                "Fecha": res['timestamp'],
-                                "Candidato": res['nombre'],
-                                "Facultad": current_fac,
-                                "Cargo": current_rol,
-                                "Nota": res['final'],
-                                "Estado": res['rec'],
-                                "Ajuste": res['ajuste'],
-                                "Feedback": res['comentarios'],
-                                "n_form": res['n_form'],
-                                "n_exp": res['n_exp'],
-                                "n_comp": res['n_comp'],
-                                "n_soft": res['n_soft'],
-                                "PDF": pdf_bytes
-                            }
-                            # Guardar en sesión
-                            st.session_state.db = pd.concat([st.session_state.db, pd.DataFrame([new_entry])], ignore_index=True)
-                            processed_count += 1
-                    
-                    # Actualizar barra global
-                    progress_bar.progress(processed_count / total_files)
-            
-            status_text.success(f"✅ Proceso finalizado. Se analizaron {processed_count} expedientes.")
-            time.sleep(1)
-            st.rerun()
+                        current_count += 1
+                        bar.progress(current_count / total_files_global)
+                
+                status.success(f"✅ Proceso Global Finalizado: {total_processed} CVs analizados.")
+                time.sleep(2)
+                st.rerun()
 
-# --- TAB 2: DASHBOARD (VISUALIZACIÓN) ---
+# --- TAB 2: DASHBOARD ---
 with tab_dash:
     df = st.session_state.db
     if not df.empty:
-        # KPIs Superiores
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Candidatos Procesados", len(df))
-        k2.metric("Nota Promedio", f"{df['Nota'].mean():.2f}")
-        k3.metric("Potenciales (Avanza)", len(df[df['Estado'] == 'Avanza']))
-        top_fac = df['Facultad'].mode()[0] if not df.empty else "N/A"
-        k4.metric("Facultad con más flujo", top_fac)
+        k1.metric("Procesados", len(df))
+        k2.metric("Promedio Global", f"{df['Nota'].mean():.2f}")
+        k3.metric("Aptos", len(df[df['Estado'] == 'Avanza']))
+        top_fac = df['Facultad'].mode()[0] if not df.empty else "-"
+        k4.metric("Facultad Top", top_fac)
         
-        st.divider()
+        st.markdown("---")
         
-        # Gráficos
         g1, g2 = st.columns([2, 1])
-        
         with g1:
-            st.subheader("Rendimiento por Facultad")
-            fig = px.box(df, x="Facultad", y="Nota", color="Facultad", points="all", title="Distribución de Puntajes")
+            st.subheader("Distribución de Puntajes")
+            fig = px.box(df, x="Facultad", y="Nota", color="Facultad", points="all", template="plotly_dark")
+            fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig, use_container_width=True)
             
         with g2:
             st.subheader("Decisión Final")
-            fig2 = px.pie(df, names="Estado", hole=0.4, color="Estado",
+            fig2 = px.pie(df, names="Estado", hole=0.4, color="Estado", template="plotly_dark",
                           color_discrete_map={'Avanza':'#2ecc71', 'Dudoso':'#f1c40f', 'Descartado':'#e74c3c'})
+            fig2.update_layout(paper_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig2, use_container_width=True)
             
-        # Tabla Ranking
-        st.subheader("🏆 Top Talent (Nota > 4.0)")
-        top_df = df[df['Nota'] >= 4.0].sort_values(by='Nota', ascending=False)
+        st.subheader("🏆 Top Talent")
+        top_df = df[df['Nota'] >= 3.8].sort_values(by='Nota', ascending=False)
         st.dataframe(
             top_df[['Candidato', 'Cargo', 'Facultad', 'Nota', 'Estado']],
             hide_index=True,
@@ -409,13 +484,12 @@ with tab_dash:
             }
         )
     else:
-        st.info("📊 El dashboard se activará cuando procese los primeros CVs.")
+        st.info("El dashboard se actualizará automáticamente al procesar CVs.")
 
 # --- TAB 3: BASE DE DATOS ---
 with tab_data:
-    st.subheader("Registro Detallado")
+    st.subheader("Base de Datos Histórica")
     if not st.session_state.db.empty:
-        # Filtros
         c_filter1, c_filter2 = st.columns(2)
         f_fac = c_filter1.multiselect("Filtrar Facultad", st.session_state.db['Facultad'].unique())
         f_est = c_filter2.multiselect("Filtrar Estado", st.session_state.db['Estado'].unique())
@@ -424,49 +498,30 @@ with tab_data:
         if f_fac: df_show = df_show[df_show['Facultad'].isin(f_fac)]
         if f_est: df_show = df_show[df_show['Estado'].isin(f_est)]
         
-        st.dataframe(
-            df_show.drop(columns=['PDF', 'n_form', 'n_exp', 'n_comp', 'n_soft']),
-            use_container_width=True,
-            hide_index=True
-        )
+        st.dataframe(df_show.drop(columns=['PDF', 'n_form', 'n_exp', 'n_comp', 'n_soft']), use_container_width=True, hide_index=True)
     else:
-        st.info("Sin datos registrados.")
+        st.info("Sin registros.")
 
-# --- TAB 4: DESCARGAS (CORREGIDO: Ahora tab_repo coincide con la definición) ---
+# --- TAB 4: DESCARGAS ---
 with tab_repo:
-    st.subheader("Gestión Documental")
+    st.subheader("Repositorio Documental")
     df = st.session_state.db
     if not df.empty:
-        # Descarga Masiva
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w") as zf:
             for idx, row in df.iterrows():
                 clean_name = re.sub(r'[^a-zA-Z0-9]', '_', row['Candidato'])
                 zf.writestr(f"{clean_name}_Informe.pdf", row['PDF'])
         
-        st.download_button(
-            label="📦 DESCARGAR TODO EL LOTE (ZIP)",
-            data=zip_buffer.getvalue(),
-            file_name=f"Informes_RRHH_{datetime.now().strftime('%Y%m%d')}.zip",
-            mime="application/zip",
-            type="primary"
-        )
-        
+        st.download_button("📦 DESCARGAR TODO (ZIP)", data=zip_buffer.getvalue(), file_name=f"Informes_{datetime.now().strftime('%Y%m%d')}.zip", type="primary")
         st.markdown("---")
-        st.write("Descargas Individuales:")
         
-        # Grid para descargas individuales
         for idx, row in df.iterrows():
             c1, c2, c3 = st.columns([3, 2, 1])
             with c1: st.write(f"📄 **{row['Candidato']}**")
-            with c2: st.caption(f"{row['Cargo']} | {row['Facultad']}")
+            with c2: st.caption(f"{row['Cargo']}")
             with c3:
-                st.download_button(
-                    "⬇ PDF",
-                    data=row['PDF'],
-                    file_name=f"Informe_{row['Candidato']}.pdf",
-                    key=f"dl_{idx}"
-                )
+                st.download_button("⬇ PDF", data=row['PDF'], file_name=f"Informe_{row['Candidato']}.pdf", key=f"dl_{idx}")
             st.divider()
     else:
         st.info("Los informes generados aparecerán aquí.")
