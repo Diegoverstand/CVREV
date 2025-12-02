@@ -276,8 +276,8 @@ with st.sidebar:
 st.markdown("## 🏢 HR Intelligence Suite: Evaluación Académica")
 st.markdown("Sistema centralizado de análisis curricular asistido por IA.")
 
-# Pestañas
-tab_load, tab_dash, tab_data, tab_docs = st.tabs([
+# Pestañas (CORREGIDO: Aquí definimos tab_repo correctamente)
+tab_load, tab_dash, tab_data, tab_repo = st.tabs([
     "⚡ Centro de Procesamiento (Multi-Lote)", 
     "📊 Dashboard Ejecutivo", 
     "🗃️ Base de Datos", 
@@ -432,7 +432,7 @@ with tab_data:
     else:
         st.info("Sin datos registrados.")
 
-# --- TAB 4: DESCARGAS ---
+# --- TAB 4: DESCARGAS (CORREGIDO: Ahora tab_repo coincide con la definición) ---
 with tab_repo:
     st.subheader("Gestión Documental")
     df = st.session_state.db
