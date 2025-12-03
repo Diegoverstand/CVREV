@@ -31,8 +31,6 @@ st.markdown("""
     .stTabs [data-baseweb="tab-list"] { gap: 10px; }
     .stTabs [data-baseweb="tab"] { height: 50px; }
     div[data-testid="stExpander"] { border: 1px solid #4a4a4a; border-radius: 5px; }
-    
-    /* Ajuste para botón de limpiar pequeño */
     .small-btn { margin-top: 0px; }
     </style>
 """, unsafe_allow_html=True)
@@ -61,18 +59,33 @@ def get_available_models(api_key):
         return ["gemini-1.5-flash"]
 
 # ==============================================================================
-# 3. BASE DE DATOS
+# 3. BASE DE DATOS (AHORA CON REGISTRO DE LOTES)
 # ==============================================================================
 
 @st.cache_resource
 def init_db():
-    conn = sqlite3.connect('cv_final_db_v4.db', check_same_thread=False)
+    conn = sqlite3.connect('cv_final_db_v5.db', check_same_thread=False)
     c = conn.cursor()
+    
+    # Tabla de Análisis (CVs individuales)
     c.execute('''CREATE TABLE IF NOT EXISTS analisis (
                     file_hash TEXT PRIMARY KEY, timestamp TEXT, lote_nombre TEXT, archivo_nombre TEXT,
                     candidato TEXT, facultad TEXT, cargo TEXT, puntaje REAL, recomendacion TEXT,
                     ajuste TEXT, comentarios TEXT, raw_json TEXT, pdf_blob BLOB
                 )''')
+    
+    # Tabla de Historial de Lotes (Nuevo Requerimiento)
+    c.execute('''CREATE TABLE IF NOT EXISTS batch_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_inicio TEXT,
+                    duracion TEXT,
+                    modo_ejecucion TEXT,
+                    lote_nombre TEXT,
+                    cantidad_archivos INTEGER,
+                    facultad TEXT,
+                    cargo TEXT
+                )''')
+    
     conn.commit()
     return conn
 
@@ -91,8 +104,6 @@ def db_save_record(data_dict, pdf_bytes, file_hash, filename, lote_name):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     json_str = json.dumps(data_dict, ensure_ascii=False)
     puntaje = float(data_dict.get('puntaje_global', 0.0))
-    
-    # Extraemos el resumen ejecutivo para la tabla
     comentarios = data_dict.get('conclusion_ejecutiva', 'Sin comentarios')
     
     c.execute('''INSERT OR REPLACE INTO analisis VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
@@ -103,8 +114,19 @@ def db_save_record(data_dict, pdf_bytes, file_hash, filename, lote_name):
                data_dict.get('ajuste', 'N/A'), comentarios, json_str, pdf_bytes))
     conn.commit()
 
+def db_log_batch(start_time, duration_str, mode, lote_name, count, fac, rol):
+    """Guarda el registro del proceso de lote."""
+    c = conn.cursor()
+    c.execute('''INSERT INTO batch_log (timestamp_inicio, duracion, modo_ejecucion, lote_nombre, cantidad_archivos, facultad, cargo)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
+              (start_time, duration_str, mode, lote_name, count, fac, rol))
+    conn.commit()
+
 def db_load_all():
     return pd.read_sql("SELECT * FROM analisis ORDER BY timestamp DESC", conn)
+
+def db_load_logs():
+    return pd.read_sql("SELECT * FROM batch_log ORDER BY id DESC", conn)
 
 # ==============================================================================
 # 4. MOTORES DE ANÁLISIS
@@ -241,15 +263,16 @@ def generate_pdf_report(data):
     return bytes(pdf.output())
 
 # ==============================================================================
-# 6. LÓGICA DE PROCESAMIENTO
+# 6. LÓGICA DE PROCESAMIENTO (CON TIMER Y REGISTRO)
 # ==============================================================================
 
-def execute_processing(batches, api_key, model_choice, skip_dupes, delay_sec):
-    total_files = sum(len(b['files']) for b in batches)
+def execute_processing(batches, api_key, model_choice, skip_dupes, delay_sec, is_massive):
+    total_files_global = sum(len(b['files']) for b in batches)
     
-    # AVISO DE TIEMPO (REQUERIMIENTO CLAVE)
-    est_time_min = (total_files * (delay_sec + 5)) / 60
-    st.info(f"⏱️ **Estimación:** Se procesarán {total_files} documentos. Tiempo aprox: {est_time_min:.1f} minutos. Por favor espere...")
+    # Estimación Inicial
+    est_sec_total = total_files_global * (delay_sec + 5)
+    est_min = est_sec_total // 60
+    st.info(f"⏱️ **Estimación Total:** Se procesarán {total_files_global} documentos. Tiempo aprox: {est_min} minutos.")
     
     # UI Containers
     progress_bar = st.progress(0, "Iniciando motor de análisis...")
@@ -257,59 +280,93 @@ def execute_processing(batches, api_key, model_choice, skip_dupes, delay_sec):
     st.subheader("📋 Datos en Vivo (Streaming)")
     live_table = st.empty()
     
-    processed, skipped, errors = 0, 0, 0
-    current_idx = 0
+    # Variables globales de la ejecución
+    processed_global = 0
+    skipped_global = 0
+    errors_global = 0
+    current_idx_global = 0
+    start_time_global = time.time()
     
+    # Iterar por lote para registrar correctamente en BD
     for batch in batches:
-        for file in batch['files']:
-            current_idx += 1
-            status.text(f"Analizando {current_idx}/{total_files}: {file.name} ({batch['id']})...")
-            
-            # 1. Duplicidad
-            file.seek(0); f_bytes = file.read(); f_hash = get_file_hash(f_bytes)
-            
-            if skip_dupes and db_check_exists(f_hash):
-                skipped += 1
-            else:
-                # 2. Análisis
-                file.seek(0)
-                text = read_file_safe(file)
-                if len(text) > 50:
-                    ai_res = analyze_with_gemini(text, batch['rol'], batch['fac'], api_key, model_choice)
-                    if ai_res:
-                        ai_res.update({'facultad': batch['fac'], 'cargo': batch['rol']})
-                        pdf = generate_pdf_report(ai_res)
-                        db_save_record(ai_res, pdf, f_hash, file.name, batch['id'])
-                        processed += 1
-                    else: errors += 1
-                else: errors += 1
+        start_time_batch = time.time()
+        files_in_batch = len(batch['files'])
+        
+        # Si el lote tiene archivos, procesamos
+        if files_in_batch > 0:
+            for file in batch['files']:
+                current_idx_global += 1
                 
-                # 3. Rate Limit
-                time.sleep(delay_sec)
+                # --- TIMER LOGIC ---
+                elapsed = time.time() - start_time_global
+                avg_time = elapsed / current_idx_global
+                remaining = avg_time * (total_files_global - current_idx_global)
+                
+                # Formato MM:SS
+                m_elap, s_elap = divmod(int(elapsed), 60)
+                m_rem, s_rem = divmod(int(remaining), 60)
+                
+                status.markdown(f"""
+                **Procesando:** `{file.name}` ({batch['id']})  
+                ⏳ **Tiempo Transcurrido:** {m_elap:02d}:{s_elap:02d} | 🏁 **Restante Estimado:** {m_rem:02d}:{s_rem:02d}
+                """)
+                
+                # 1. Duplicidad
+                file.seek(0); f_bytes = file.read(); f_hash = get_file_hash(f_bytes)
+                
+                if skip_dupes and db_check_exists(f_hash):
+                    skipped_global += 1
+                else:
+                    # 2. Análisis
+                    file.seek(0)
+                    text = read_file_safe(file)
+                    if len(text) > 50:
+                        ai_res = analyze_with_gemini(text, batch['rol'], batch['fac'], api_key, model_choice)
+                        if ai_res:
+                            ai_res.update({'facultad': batch['fac'], 'cargo': batch['rol']})
+                            pdf = generate_pdf_report(ai_res)
+                            db_save_record(ai_res, pdf, f_hash, file.name, batch['id'])
+                            processed_global += 1
+                        else: errors_global += 1
+                    else: errors_global += 1
+                    
+                    # 3. Rate Limit
+                    time.sleep(delay_sec)
+                
+                # 4. Actualizar UI
+                progress_bar.progress(current_idx_global / total_files_global)
+                
+                # STREAMING EN VIVO (Con nuevas columnas)
+                with live_table.container():
+                    df = db_load_all()
+                    if not df.empty:
+                        st.dataframe(
+                            df[['timestamp', 'lote_nombre', 'candidato', 'facultad', 'cargo', 'puntaje', 'recomendacion', 'comentarios']].head(5),
+                            column_config={
+                                "timestamp": st.column_config.DatetimeColumn("Hora", format="HH:mm:ss"),
+                                "puntaje": st.column_config.ProgressColumn("Puntaje", format="%.2f", min_value=0, max_value=5),
+                                "comentarios": st.column_config.TextColumn("Resumen Ejecutivo", width="large")
+                            },
+                            use_container_width=True,
+                            hide_index=True
+                        )
             
-            # 4. Actualizar UI
-            progress_bar.progress(current_idx / total_files)
+            # --- FIN DEL LOTE: REGISTRAR LOG ---
+            end_time_batch = time.time()
+            batch_duration_sec = end_time_batch - start_time_batch
+            m_dur, s_dur = divmod(int(batch_duration_sec), 60)
+            duration_str = f"{m_dur:02d}:{s_dur:02d}"
             
-            # STREAMING EN VIVO DE LA TABLA COMPLETA
-            with live_table.container():
-                df = db_load_all()
-                if not df.empty:
-                    st.dataframe(
-                        df[['timestamp', 'lote_nombre', 'candidato', 'puntaje', 'recomendacion', 'comentarios']],
-                        column_config={
-                            "timestamp": st.column_config.DatetimeColumn("Hora", format="HH:mm:ss"),
-                            "puntaje": st.column_config.ProgressColumn("Puntaje", format="%.2f", min_value=0, max_value=5),
-                            "comentarios": st.column_config.TextColumn("Resumen Ejecutivo", width="large")
-                        },
-                        use_container_width=True,
-                        hide_index=True
-                    )
+            mode_str = "Masivo" if is_massive else "Individual"
+            timestamp_str = datetime.fromtimestamp(start_time_batch).strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Guardamos el registro de este lote específico
+            db_log_batch(timestamp_str, duration_str, mode_str, batch['id'], files_in_batch, batch['fac'], batch['rol'])
 
-    status.success(f"Finalizado. Nuevos: {processed} | Saltados: {skipped} | Errores: {errors}")
+    status.success(f"Finalizado. Nuevos: {processed_global} | Saltados: {skipped_global} | Errores: {errors_global}")
     time.sleep(2)
     st.rerun()
 
-#Función helper para limpiar lote
 def clear_batch_state(key):
     if key in st.session_state:
         del st.session_state[key]
@@ -352,11 +409,14 @@ with st.sidebar:
     st.divider()
     skip_dupes = st.checkbox("Omitir Duplicados", value=True)
     if st.button("🗑️ Borrar Historial"):
-        conn.cursor().execute("DELETE FROM analisis"); conn.commit(); st.rerun()
+        conn.cursor().execute("DELETE FROM analisis")
+        conn.cursor().execute("DELETE FROM batch_log")
+        conn.commit()
+        st.rerun()
 
 st.title("🚀 HR Intelligence Suite")
 
-tab1, tab2, tab3, tab4 = st.tabs(["📥 Centro de Carga", "📊 Dashboard", "🗃️ Base de Datos", "📂 Repositorio"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📥 Centro de Carga", "📊 Dashboard", "🗃️ Base de Datos", "📂 Repositorio", "📜 Registro de Procesos"])
 
 FACULTADES = ["Facultad de Ingeniería", "Facultad de Economía y Negocios", "Facultad de Ciencias de la Vida", "Facultad de Educación y Ciencias Sociales"]
 CARGOS = ["Docente", "Investigador", "Gestión Académica"]
@@ -368,7 +428,6 @@ with tab1:
     
     def render_batch(col, idx):
         with col, st.container(border=True):
-            # Header con Botón de Limpiar
             sub_c1, sub_c2 = st.columns([4, 1])
             sub_c1.subheader(f"📂 Lote #{idx}")
             if sub_c2.button("🗑️", key=f"clr{idx}", help="Limpiar archivos de este lote"):
@@ -378,9 +437,10 @@ with tab1:
             fac = st.selectbox("Facultad", FACULTADES, key=f"f{idx}")
             rol = st.selectbox("Cargo", CARGOS, key=f"r{idx}")
             
+            # Botón Individual (Modo Individual)
             if st.button(f"▶ Procesar Lote {idx}", key=f"b{idx}"):
                 if api_key and model_choice and files:
-                    execute_processing([{'id': f"Lote {idx}", 'files': files, 'fac': fac, 'rol': rol}], api_key, model_choice, skip_dupes, delay)
+                    execute_processing([{'id': f"Lote {idx}", 'files': files, 'fac': fac, 'rol': rol}], api_key, model_choice, skip_dupes, delay, is_massive=False)
                 else: st.error("Verifique Configuración")
             
             if files: batches_data.append({'id': f"Lote {idx}", 'files': files, 'fac': fac, 'rol': rol})
@@ -389,9 +449,10 @@ with tab1:
     render_batch(c1, 3); render_batch(c2, 4)
     
     st.markdown("---")
+    # Botón Masivo (Modo Masivo)
     if st.button("🚀 PROCESAR TODO", type="primary", use_container_width=True):
         if api_key and model_choice and batches_data:
-            execute_processing(batches_data, api_key, model_choice, skip_dupes, delay)
+            execute_processing(batches_data, api_key, model_choice, skip_dupes, delay, is_massive=True)
         else: st.error("Faltan datos o API Key")
 
 # --- TAB 2: DASHBOARD ---
@@ -408,13 +469,13 @@ with tab2:
         with g2: st.plotly_chart(px.pie(df, names='recomendacion'), use_container_width=True)
     else: st.info("Sin datos.")
 
-# --- TAB 3: DATOS ---
+# --- TAB 3: DATOS (Actualizada con nuevas columnas) ---
 with tab3:
     st.header("🗃️ Base de Datos Completa")
     df = db_load_all()
     if not df.empty:
         st.dataframe(
-            df[['timestamp', 'lote_nombre', 'candidato', 'puntaje', 'recomendacion', 'comentarios']],
+            df[['timestamp', 'lote_nombre', 'candidato', 'facultad', 'cargo', 'puntaje', 'recomendacion', 'comentarios']],
             column_config={
                 "timestamp": st.column_config.DatetimeColumn("Hora", format="HH:mm:ss"),
                 "puntaje": st.column_config.ProgressColumn("Puntaje", format="%.2f", min_value=0, max_value=5),
@@ -441,3 +502,21 @@ with tab4:
             with st.expander(f"{r['candidato']} ({r['puntaje']})"):
                 if r['pdf_blob']: st.download_button("PDF", r['pdf_blob'], f"{r['candidato']}.pdf", key=f"d{i}")
     else: st.info("Sin informes.")
+
+# --- TAB 5: REGISTRO (Nueva) ---
+with tab5:
+    st.header("📜 Historial de Ejecuciones")
+    df_logs = db_load_logs()
+    if df_logs.empty:
+        st.info("No hay registros de procesos.")
+    else:
+        st.dataframe(
+            df_logs,
+            column_config={
+                "timestamp_inicio": st.column_config.DatetimeColumn("Inicio", format="DD/MM HH:mm"),
+                "duracion": "Duración",
+                "cantidad_archivos": "Archivos"
+            },
+            use_container_width=True,
+            hide_index=True
+        )
