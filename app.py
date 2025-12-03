@@ -12,7 +12,7 @@ from datetime import datetime
 from fpdf import FPDF
 import plotly.express as px
 
-# --- 1. CONFIGURACIÓN E INICIALIZACIÓN ---
+# --- 1. CONFIGURACIÓN ---
 st.set_page_config(
     page_title="HR Intelligence Suite",
     layout="wide",
@@ -27,7 +27,7 @@ if 'db' not in st.session_state:
         'n_form', 'n_exp', 'n_comp', 'n_soft'
     ])
 
-# CSS PROFESIONAL
+# CSS
 st.markdown("""
     <style>
     .main { background-color: #0E1117; }
@@ -68,7 +68,7 @@ RUBRICA = {
     }
 }
 
-# --- 3. FUNCIONES DE LECTURA Y ANÁLISIS ---
+# --- 3. FUNCIONES ---
 
 def read_file(file):
     try:
@@ -83,14 +83,9 @@ def read_file(file):
             doc = Document(file)
             return "\n".join([p.text for p in doc.paragraphs])
         return ""
-    except Exception as e:
-        return ""
+    except Exception: return ""
 
 def analyze_gemini_safe(text, role, faculty, api_key):
-    """
-    Intenta analizar con Gemini Flash. Si falla por versión/modelo,
-    hace fallback a Gemini Pro automáticamente.
-    """
     genai.configure(api_key=api_key)
     
     crit = RUBRICA[role]
@@ -113,25 +108,30 @@ def analyze_gemini_safe(text, role, faculty, api_key):
     CV: {text[:15000]}
     """
 
-    # --- LÓGICA DE INTENTOS Y MODELOS ---
-    modelos_a_probar = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+    # --- LISTA DE MODELOS LIMPIA ---
+    # Eliminado 1.5-flash por error 404
+    # Priorizamos el experimental nuevo (2.0) y usamos 1.5 Pro como respaldo seguro
+    modelos = [
+        'gemini-2.0-flash-exp', 
+        'gemini-1.5-pro'
+    ]
+    
     response = None
     last_error = ""
 
-    for modelo_nombre in modelos_a_probar:
+    for m_name in modelos:
         try:
-            model = genai.GenerativeModel(modelo_nombre)
+            model = genai.GenerativeModel(m_name)
             response = model.generate_content(prompt)
-            break # Si funciona, salimos del loop
+            break 
         except Exception as e:
             last_error = str(e)
-            continue # Si falla, probamos el siguiente
+            continue
 
     if not response:
-        st.error(f"Error de conexión con IA (Todos los modelos fallaron). Último error: {last_error}")
+        st.error(f"Error de conexión IA. Intenta actualizar 'requirements.txt'. Detalle: {last_error}")
         return None
 
-    # --- PROCESAMIENTO DE RESPUESTA ---
     try:
         raw = response.text
         start = raw.find('{')
@@ -153,10 +153,10 @@ def analyze_gemini_safe(text, role, faculty, api_key):
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
         }
     except Exception as e:
-        st.error(f"Error procesando datos: {str(e)}")
+        st.error(f"Error procesando: {str(e)}")
         return None
 
-# --- 4. GENERADOR PDF ---
+# --- 4. PDF ---
 class PDFReport(FPDF):
     def header(self):
         self.set_font('Arial', 'B', 14)
@@ -213,7 +213,7 @@ def generate_pdf_bytes(data):
     pdf.multi_cell(0, 6, txt(data.get('comentarios', '')))
     return pdf.output(dest='S').encode('latin-1')
 
-# --- 5. LÓGICA DE PROCESAMIENTO ---
+# --- 5. LÓGICA BATCH ---
 def run_batch_process(files, faculty, role, api_key, status_container):
     count = 0
     if not files: return 0
@@ -224,7 +224,7 @@ def run_batch_process(files, faculty, role, api_key, status_container):
             text = read_file(f)
             
             if len(text) < 50:
-                st.warning(f"⚠️ {f.name}: Archivo vacío o imagen.")
+                st.warning(f"⚠️ {f.name}: Archivo vacío.")
                 continue
             
             st.text(f"🤖 Analizando: {f.name}...")
@@ -249,12 +249,11 @@ def run_batch_process(files, faculty, role, api_key, status_container):
                 }
                 st.session_state.db = pd.concat([st.session_state.db, pd.DataFrame([new_entry])], ignore_index=True)
                 count += 1
-                st.success(f"✅ {f.name} OK (Nota: {res['final']})")
-            # Los errores ya se imprimen en analyze_gemini_safe
-                
+                st.success(f"✅ {f.name} OK")
+            
     return count
 
-# --- 6. INTERFAZ PRINCIPAL ---
+# --- 6. INTERFAZ ---
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/9187/9187604.png", width=50)
     st.title("Admin Console")
@@ -269,7 +268,7 @@ st.markdown("## 🏢 HR Intelligence Suite")
 tab_load, tab_dash, tab_data, tab_repo = st.tabs(["⚡ Procesamiento", "📊 Dashboard", "🗃️ Datos", "📂 PDFs"])
 
 with tab_load:
-    st.info("Cargue sus CVs y seleccione perfiles.")
+    st.info("Cargue sus CVs. Puede procesar lotes individuales o todo junto.")
     col1, col2 = st.columns(2)
     
     def draw_batch(col, idx, color_class):
@@ -282,13 +281,13 @@ with tab_load:
             
             if st.button(f"▶ Procesar Lote {idx}", key=f"btn_{idx}"):
                 if not api_key: st.error("Falta API Key")
-                elif not files: st.warning("Lote vacío")
+                elif not files: st.warning("Vacío")
                 else:
                     status_box = st.container()
                     n = run_batch_process(files, fac, rol, api_key, status_box)
                     if n > 0:
                         st.success(f"Lote {idx}: {n} procesados.")
-                        time.sleep(1.5)
+                        time.sleep(1)
                         st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -298,9 +297,9 @@ with tab_load:
     draw_batch(col2, 4, "border-4")
 
     st.markdown("---")
-    if st.button("🚀 PROCESAR TODOS LOS LOTES ACTIVOS", type="primary"):
+    if st.button("🚀 PROCESAR TODO", type="primary"):
         if not api_key:
-            st.error("🔑 Faltan credenciales.")
+            st.error("Falta API Key")
         else:
             total = 0
             status_global = st.container()
@@ -315,11 +314,11 @@ with tab_load:
                         total += n
             if total > 0:
                 st.balloons()
-                st.success(f"✅ Masivo completado: {total} registros.")
+                st.success(f"Total: {total} registros.")
                 time.sleep(2)
                 st.rerun()
             else:
-                st.warning("⚠️ No hay archivos para procesar.")
+                st.warning("No hay archivos.")
 
 with tab_dash:
     df = st.session_state.db
@@ -328,7 +327,7 @@ with tab_dash:
         k1.metric("Total", len(df))
         k2.metric("Promedio", f"{df['Nota'].mean():.2f}")
         k3.metric("Aptos", len(df[df['Estado'] == 'Avanza']))
-        k4.metric("Facultad Top", df['Facultad'].mode()[0] if not df.empty else "-")
+        k4.metric("Facultad Top", df['Facultad'].mode()[0])
         st.markdown("---")
         g1, g2 = st.columns([2,1])
         with g1:
@@ -340,15 +339,12 @@ with tab_dash:
             fig2.update_layout(paper_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig2, use_container_width=True)
         st.dataframe(df[df['Nota']>=3.8][['Candidato','Cargo','Facultad','Nota','Estado']], hide_index=True, use_container_width=True)
-    else:
-        st.info("Sin datos.")
+    else: st.info("Sin datos.")
 
 with tab_data:
     df = st.session_state.db
-    if not df.empty:
-        st.dataframe(df.drop(columns=['PDF', 'n_form', 'n_exp', 'n_comp', 'n_soft']), use_container_width=True)
-    else:
-        st.info("Vacío.")
+    if not df.empty: st.dataframe(df.drop(columns=['PDF', 'n_form', 'n_exp', 'n_comp', 'n_soft']), use_container_width=True)
+    else: st.info("Vacío.")
 
 with tab_repo:
     df = st.session_state.db
@@ -364,5 +360,4 @@ with tab_repo:
             c1, c2 = st.columns([4,1])
             c1.write(f"📄 {r['Candidato']}")
             c2.download_button("Bajar", r['PDF'], f"{r['Candidato']}.pdf", key=f"d_{i}")
-    else:
-        st.info("Sin informes.")
+    else: st.info("Sin informes.")
