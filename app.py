@@ -36,9 +36,6 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Inicializar Session State
-for i in range(1, 5):
-    if f"u{i}" not in st.session_state: st.session_state[f"u{i}"] = []
 
 # ==============================================================================
 # 2. GESTIÓN DE BASE DE DATOS
@@ -385,4 +382,5 @@ with tab4:
 with tab5:
     st.header("📜 Historial Lotes"); df_log = db_load_logs()
     if not df_log.empty: st.dataframe(df_log, use_container_width=True)
+
     else: st.info("Sin historial.")
