@@ -3,7 +3,6 @@ pandas
 google-generativeai>=0.7.0
 pypdf2
 python-docx
-xlsxwriter
-openpyxl
 fpdf2
 plotly
+openpyxl
