@@ -32,8 +32,6 @@ st.markdown("""
     .stTabs [data-baseweb="tab"] { height: 50px; }
     div[data-testid="stExpander"] { border: 1px solid #4a4a4a; border-radius: 5px; }
     .small-btn { margin-top: 0px; }
-    
-    /* Estilo para tabla de errores */
     .error-row { color: #ff4b4b; }
     </style>
 """, unsafe_allow_html=True)
@@ -62,34 +60,37 @@ def get_available_models(api_key):
         return ["gemini-1.5-flash"]
 
 # ==============================================================================
-# 3. BASE DE DATOS (CON TABLA DE ERRORES)
+# 3. BASE DE DATOS (ACTUALIZADA CON ESTADO DE PROCESO)
 # ==============================================================================
 
 @st.cache_resource
 def init_db():
-    conn = sqlite3.connect('cv_final_db_v6.db', check_same_thread=False)
+    conn = sqlite3.connect('cv_final_db_v7.db', check_same_thread=False)
     c = conn.cursor()
     
-    # 1. Tabla de Análisis Exitosos
+    # Tablas
     c.execute('''CREATE TABLE IF NOT EXISTS analisis (
                     file_hash TEXT PRIMARY KEY, timestamp TEXT, lote_nombre TEXT, archivo_nombre TEXT,
                     candidato TEXT, facultad TEXT, cargo TEXT, puntaje REAL, recomendacion TEXT,
-                    ajuste TEXT, comentarios TEXT, raw_json TEXT, pdf_blob BLOB
+                    ajuste TEXT, comentarios TEXT, raw_json TEXT, pdf_blob BLOB,
+                    facultad_filtro TEXT, cargo_filtro TEXT
                 )''')
     
-    # 2. Tabla de Historial de Lotes
+    # Se agregó columna 'estado' para saber si terminó o falló
     c.execute('''CREATE TABLE IF NOT EXISTS batch_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp_inicio TEXT,
+                    timestamp_fin TEXT,
                     duracion TEXT,
                     modo_ejecucion TEXT,
                     lote_nombre TEXT,
-                    cantidad_archivos INTEGER,
+                    cantidad_total INTEGER,
+                    cantidad_procesada INTEGER,
                     facultad TEXT,
-                    cargo TEXT
+                    cargo TEXT,
+                    estado TEXT
                 )''')
     
-    # 3. Tabla de Errores (NUEVA)
     c.execute('''CREATE TABLE IF NOT EXISTS error_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp TEXT,
@@ -103,6 +104,7 @@ def init_db():
 
 conn = init_db()
 
+# --- Funciones BD ---
 def get_file_hash(file_bytes):
     return hashlib.md5(file_bytes).hexdigest()
 
@@ -111,34 +113,51 @@ def db_check_exists(file_hash):
     c.execute("SELECT candidato FROM analisis WHERE file_hash = ?", (file_hash,))
     return c.fetchone() is not None
 
-def db_save_record(data_dict, pdf_bytes, file_hash, filename, lote_name):
+def db_save_record(data_dict, pdf_bytes, file_hash, filename, lote_name, fac, rol):
     c = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     json_str = json.dumps(data_dict, ensure_ascii=False)
     puntaje = float(data_dict.get('puntaje_global', 0.0))
     comentarios = data_dict.get('conclusion_ejecutiva', 'Sin comentarios')
     
-    c.execute('''INSERT OR REPLACE INTO analisis VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+    # Guardamos también fac y rol como columnas explícitas para filtros
+    c.execute('''INSERT OR REPLACE INTO analisis VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
               (file_hash, now, lote_name, filename, 
                data_dict.get('nombre', 'Desconocido'),
-               data_dict.get('facultad', ''), data_dict.get('cargo', ''),
-               puntaje, data_dict.get('recomendacion', 'N/A'),
-               data_dict.get('ajuste', 'N/A'), comentarios, json_str, pdf_bytes))
+               fac, rol, puntaje, data_dict.get('recomendacion', 'N/A'),
+               data_dict.get('ajuste', 'N/A'), comentarios, json_str, pdf_bytes, fac, rol))
     conn.commit()
 
 def db_save_error(filename, lote_name, causa):
-    """Registra un archivo fallido en la BD."""
     c = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     c.execute('''INSERT INTO error_log (timestamp, lote_nombre, archivo_nombre, causa)
                  VALUES (?, ?, ?, ?)''', (now, lote_name, filename, causa))
     conn.commit()
 
-def db_log_batch(start_time, duration_str, mode, lote_name, count, fac, rol):
+# --- Nuevas Funciones de Log de Lotes (Inicio y Fin separados) ---
+def db_log_start(mode, lote_name, total, fac, rol):
     c = conn.cursor()
-    c.execute('''INSERT INTO batch_log (timestamp_inicio, duracion, modo_ejecucion, lote_nombre, cantidad_archivos, facultad, cargo)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('''INSERT INTO batch_log (timestamp_inicio, modo_ejecucion, lote_nombre, cantidad_total, facultad, cargo, estado)
                  VALUES (?, ?, ?, ?, ?, ?, ?)''',
-              (start_time, duration_str, mode, lote_name, count, fac, rol))
+              (now, mode, lote_name, total, fac, rol, "En Progreso..."))
+    conn.commit()
+    return c.lastrowid # Retornamos el ID para actualizarlo luego
+
+def db_log_end(log_id, processed_count, status_msg, start_ts_float):
+    c = conn.cursor()
+    end_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Calcular duración
+    duration_sec = time.time() - start_ts_float
+    m, s = divmod(int(duration_sec), 60)
+    dur_str = f"{m:02d}:{s:02d}"
+    
+    c.execute('''UPDATE batch_log 
+                 SET timestamp_fin = ?, duracion = ?, cantidad_procesada = ?, estado = ?
+                 WHERE id = ?''',
+              (end_ts, dur_str, processed_count, status_msg, log_id))
     conn.commit()
 
 def db_load_all():
@@ -172,24 +191,17 @@ def analyze_with_gemini(text, role, faculty, api_key, model_choice):
     
     prompt = f"""
     Actúa como Consultor de Selección. Evalúa CV para: {role} - {faculty}.
-    
-    RÚBRICA:
-    1. Formación (35%)
-    2. Experiencia (30%)
-    3. Competencias (20%)
-    4. Software (15%)
-    
+    RÚBRICA: 1. Formación (35%) 2. Experiencia (30%) 3. Competencias (20%) 4. Software (15%)
     REGLAS:
     - Puntaje Global: 0.00 a 5.00 (Dos decimales)
     - Recomendación: "AVANZA" (>=3.75), "REQUIERE ANTECEDENTES" (3.00-3.74), "NO RECOMENDADO" (<3.00)
-    
     OUTPUT JSON (Estricto):
     {{
         "nombre": "Nombre Apellido",
         "ajuste": "ALTO/MEDIO/BAJO",
         "puntaje_global": 0.00,
         "recomendacion": "ESTADO",
-        "conclusion_ejecutiva": "Resumen breve de maximo 40 palabras.",
+        "conclusion_ejecutiva": "Resumen breve.",
         "detalle_puntajes": {{
             "formacion": {{ "nota": 0, "ponderado": 0.00 }},
             "experiencia": {{ "nota": 0, "ponderado": 0.00 }},
@@ -234,14 +246,12 @@ def generate_pdf_report(data):
     pdf.set_font('Arial', 'B', 11); pdf.cell(30, 6, "Cargo:", 0, 0); pdf.set_font('Arial', '', 11)
     pdf.cell(0, 6, txt(f"{data.get('cargo')} - {data.get('facultad')}"), 0, 1); pdf.ln(8)
     
-    # Conclusión
     pdf.set_font('Arial', 'B', 12); pdf.set_fill_color(240, 240, 240)
     pdf.cell(0, 8, txt("A. CONCLUSIÓN EJECUTIVA"), 1, 1, 'L', True); pdf.ln(2)
     pdf.set_font('Arial', '', 10)
     pdf.multi_cell(0, 5, txt(f"Ajuste: {data.get('ajuste')}. Puntaje: {data.get('puntaje_global', 0):.2f}/5.00.\n{data.get('conclusion_ejecutiva')}"))
     pdf.ln(5)
     
-    # Semáforo
     rec = data.get('recomendacion', '').upper()
     if "NO" in rec: pdf.set_fill_color(255, 200, 200)
     elif "AVANZA" in rec: pdf.set_fill_color(200, 255, 200)
@@ -285,40 +295,44 @@ def generate_pdf_report(data):
     return bytes(pdf.output())
 
 # ==============================================================================
-# 6. LÓGICA DE PROCESAMIENTO (CON TIMER Y REGISTRO)
+# 6. LÓGICA DE PROCESAMIENTO (ROBUSTA CON TRY/EXCEPT Y LOGGING)
 # ==============================================================================
 
 def execute_processing(batches, api_key, model_choice, skip_dupes, delay_sec, is_massive):
     total_files_global = sum(len(b['files']) for b in batches)
     
-    # Estimación Inicial
     est_sec_total = total_files_global * (delay_sec + 5)
     est_min = est_sec_total // 60
-    st.info(f"⏱️ **Estimación Total:** Se procesarán {total_files_global} documentos. Tiempo aprox: {est_min} minutos.")
+    st.info(f"⏱️ **Estimación Total:** {total_files_global} documentos. Tiempo aprox: {est_min} minutos. POR FAVOR NO CIERRE ESTA PESTAÑA.")
     
-    # UI Containers
-    progress_bar = st.progress(0, "Iniciando motor de análisis...")
+    progress_bar = st.progress(0, "Iniciando...")
     status = st.empty()
     st.subheader("📋 Datos en Vivo (Streaming)")
     live_table = st.empty()
     
-    # Variables globales
     processed_global = 0
     skipped_global = 0
     errors_global = 0
     current_idx_global = 0
     start_time_global = time.time()
     
-    # Iterar por lote
-    for batch in batches:
-        start_time_batch = time.time()
-        files_in_batch = len(batch['files'])
-        
-        if files_in_batch > 0:
+    # --- Try/Except Global para atrapar interrupciones ---
+    try:
+        for batch in batches:
+            files_in_batch = len(batch['files'])
+            if files_in_batch == 0: continue
+
+            # 1. Registrar Inicio del Lote en BD
+            start_time_batch = time.time()
+            mode_str = "Masivo" if is_massive else "Individual"
+            log_id = db_log_start(mode_str, batch['id'], files_in_batch, batch['fac'], batch['rol'])
+            
+            processed_in_batch = 0 # Contador local para el log
+            
             for file in batch['files']:
                 current_idx_global += 1
                 
-                # --- TIMER LOGIC ---
+                # Timer
                 elapsed = time.time() - start_time_global
                 avg_time = elapsed / current_idx_global if current_idx_global > 0 else 0
                 remaining = avg_time * (total_files_global - current_idx_global)
@@ -327,72 +341,76 @@ def execute_processing(batches, api_key, model_choice, skip_dupes, delay_sec, is
                 
                 status.markdown(f"""
                 **Procesando:** `{file.name}` ({batch['id']})  
-                ⏳ **Tiempo Transcurrido:** {m_elap:02d}:{s_elap:02d} | 🏁 **Restante Estimado:** {m_rem:02d}:{s_rem:02d}
+                ⏳ **Transcurrido:** {m_elap:02d}:{s_elap:02d} | 🏁 **Restante:** {m_rem:02d}:{s_rem:02d}
                 """)
                 
-                # 1. Duplicidad
-                file.seek(0); f_bytes = file.read(); f_hash = get_file_hash(f_bytes)
-                
-                if skip_dupes and db_check_exists(f_hash):
-                    skipped_global += 1
-                else:
-                    # 2. Análisis
-                    file.seek(0)
-                    text = read_file_safe(file)
+                try:
+                    # 1. Hash & Check
+                    file.seek(0); f_bytes = file.read(); f_hash = get_file_hash(f_bytes)
                     
-                    # LOGICA DE RECHAZO: Si no hay texto, es error inmediato
-                    if len(text) < 50:
-                        errors_global += 1
-                        db_save_error(file.name, batch['id'], "Archivo vacío, imagen escaneada o ilegible")
+                    if skip_dupes and db_check_exists(f_hash):
+                        skipped_global += 1
                     else:
-                        ai_res = analyze_with_gemini(text, batch['rol'], batch['fac'], api_key, model_choice)
-                        if ai_res:
-                            ai_res.update({'facultad': batch['fac'], 'cargo': batch['rol']})
-                            pdf = generate_pdf_report(ai_res)
-                            db_save_record(ai_res, pdf, f_hash, file.name, batch['id'])
-                            processed_global += 1
-                        else: 
+                        # 2. Análisis
+                        file.seek(0)
+                        text = read_file_safe(file)
+                        
+                        if len(text) < 50:
                             errors_global += 1
-                            db_save_error(file.name, batch['id'], "Fallo en respuesta de IA")
-                    
-                    # 3. Rate Limit
-                    time.sleep(delay_sec)
+                            db_save_error(file.name, batch['id'], "Archivo vacío/ilegible")
+                        else:
+                            ai_res = analyze_with_gemini(text, batch['rol'], batch['fac'], api_key, model_choice)
+                            if ai_res:
+                                ai_res.update({'facultad': batch['fac'], 'cargo': batch['rol']})
+                                pdf = generate_pdf_report(ai_res)
+                                # Guardamos fac y rol explícitamente en BD
+                                db_save_record(ai_res, pdf, f_hash, file.name, batch['id'], batch['fac'], batch['rol'])
+                                processed_global += 1
+                                processed_in_batch += 1
+                            else: 
+                                errors_global += 1
+                                db_save_error(file.name, batch['id'], "Fallo IA")
+                        
+                        # 3. Rate Limit
+                        time.sleep(delay_sec)
                 
-                # 4. Actualizar UI
+                except Exception as e:
+                    errors_global += 1
+                    db_save_error(file.name, batch['id'], f"Error Sistema: {str(e)}")
+                
+                # UI Update
                 progress_bar.progress(current_idx_global / total_files_global)
                 
-                # STREAMING EN VIVO
-                with live_table.container():
-                    df = db_load_all()
-                    if not df.empty:
-                        st.dataframe(
-                            df[['timestamp', 'lote_nombre', 'candidato', 'facultad', 'cargo', 'puntaje', 'recomendacion', 'comentarios']].head(10),
-                            column_config={
-                                "timestamp": st.column_config.DatetimeColumn("Hora", format="HH:mm:ss"),
-                                "puntaje": st.column_config.ProgressColumn("Puntaje", format="%.2f", min_value=0, max_value=5),
-                                "comentarios": st.column_config.TextColumn("Resumen Ejecutivo", width="large")
-                            },
-                            use_container_width=True,
-                            hide_index=True
-                        )
+                if current_idx_global % 1 == 0:
+                    with live_table.container():
+                        df = db_load_all()
+                        if not df.empty:
+                            st.dataframe(
+                                df[['timestamp', 'lote_nombre', 'candidato', 'puntaje', 'recomendacion', 'comentarios']].head(5),
+                                column_config={
+                                    "puntaje": st.column_config.ProgressColumn("Puntaje", format="%.2f", min_value=0, max_value=5),
+                                    "comentarios": st.column_config.TextColumn("Resumen", width="large")
+                                }, use_container_width=True, hide_index=True
+                            )
             
-            # --- FIN DEL LOTE: REGISTRAR LOG ---
-            end_time_batch = time.time()
-            batch_duration_sec = end_time_batch - start_time_batch
-            m_dur, s_dur = divmod(int(batch_duration_sec), 60)
-            duration_str = f"{m_dur:02d}:{s_dur:02d}"
-            
-            mode_str = "Masivo" if is_massive else "Individual"
-            timestamp_str = datetime.fromtimestamp(start_time_batch).strftime("%Y-%m-%d %H:%M:%S")
-            db_log_batch(timestamp_str, duration_str, mode_str, batch['id'], files_in_batch, batch['fac'], batch['rol'])
+            # 4. Cerrar Log del Lote (Éxito)
+            db_log_end(log_id, processed_in_batch, "Finalizado Exitoso", start_time_batch)
 
-    status.success(f"Finalizado. Nuevos: {processed_global} | Saltados: {skipped_global} | Errores: {errors_global}")
-    time.sleep(2)
-    st.rerun()
+        status.success(f"Finalizado. Nuevos: {processed_global} | Saltados: {skipped_global} | Errores: {errors_global}")
+    
+    except Exception as e:
+        st.error(f"⚠️ El proceso se interrumpió inesperadamente: {str(e)}")
+        # Intentar cerrar el log si quedó abierto
+        try:
+            db_log_end(log_id, processed_in_batch, "Interrumpido / Error", start_time_batch)
+        except: pass
+    
+    finally:
+        time.sleep(2)
+        st.rerun()
 
 def clear_batch_state(key):
-    if key in st.session_state:
-        del st.session_state[key]
+    if key in st.session_state: del st.session_state[key]
     st.rerun()
 
 # ==============================================================================
@@ -403,9 +421,8 @@ api_key, is_corporate = get_api_key()
 
 with st.sidebar:
     st.header("⚙️ Configuración")
-    
     if is_corporate:
-        st.success("✅ Licencia Corporativa Activa")
+        st.success("✅ Licencia Corporativa")
     else:
         user_input = st.text_input("Google API Key", type="password")
         if user_input:
@@ -415,23 +432,19 @@ with st.sidebar:
 
     st.divider()
     
-    st.subheader("🧠 Modelo de IA")
+    st.subheader("🧠 IA & Rendimiento")
     if api_key:
         available_models = get_available_models(api_key)
-        if available_models:
-            model_choice = st.selectbox("Modelo Detectado:", available_models, index=0)
-        else:
-            st.error("Error al cargar modelos.")
-            model_choice = None
+        model_choice = st.selectbox("Modelo:", available_models, index=0) if available_models else None
     else:
         st.warning("Ingrese API Key.")
         model_choice = None
         
-    delay = st.slider("Pausa entre análisis (seg)", 2, 20, 5)
+    delay = st.slider("Pausa entre CVs (seg)", 2, 20, 5, help="Más alto = Menos riesgo de bloqueo.")
     
     st.divider()
     skip_dupes = st.checkbox("Omitir Duplicados", value=True)
-    if st.button("🗑️ Borrar Historial"):
+    if st.button("🗑️ Reset Total"):
         conn.cursor().execute("DELETE FROM analisis")
         conn.cursor().execute("DELETE FROM batch_log")
         conn.cursor().execute("DELETE FROM error_log")
@@ -440,7 +453,7 @@ with st.sidebar:
 
 st.title("🚀 HR Intelligence Suite")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📥 Centro de Carga", "📊 Dashboard", "🗃️ Base de Datos", "📂 Repositorio", "📜 Registro de Procesos"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📥 Centro de Carga", "📊 Dashboard", "🗃️ Base de Datos", "📂 Repositorio", "📜 Historial Lotes"])
 
 FACULTADES = ["Facultad de Ingeniería", "Facultad de Economía y Negocios", "Facultad de Ciencias de la Vida", "Facultad de Educación y Ciencias Sociales"]
 CARGOS = ["Docente", "Investigador", "Gestión Académica"]
@@ -454,8 +467,7 @@ with tab1:
         with col, st.container(border=True):
             sub_c1, sub_c2 = st.columns([4, 1])
             sub_c1.subheader(f"📂 Lote #{idx}")
-            if sub_c2.button("🗑️", key=f"clr{idx}", help="Limpiar archivos de este lote"):
-                clear_batch_state(f"u{idx}")
+            if sub_c2.button("🗑️", key=f"clr{idx}"): clear_batch_state(f"u{idx}")
 
             files = st.file_uploader(f"Docs {idx}", accept_multiple_files=True, key=f"u{idx}", label_visibility="collapsed")
             fac = st.selectbox("Facultad", FACULTADES, key=f"f{idx}")
@@ -463,7 +475,7 @@ with tab1:
             
             if st.button(f"▶ Procesar Lote {idx}", key=f"b{idx}"):
                 if api_key and model_choice and files:
-                    execute_processing([{'id': f"Lote {idx}", 'files': files, 'fac': fac, 'rol': rol}], api_key, model_choice, skip_dupes, delay, is_massive=False)
+                    execute_processing([{'id': f"Lote {idx}", 'files': files, 'fac': fac, 'rol': rol}], api_key, model_choice, skip_dupes, delay, False)
                 else: st.error("Verifique Configuración")
             
             if files: batches_data.append({'id': f"Lote {idx}", 'files': files, 'fac': fac, 'rol': rol})
@@ -474,7 +486,7 @@ with tab1:
     st.markdown("---")
     if st.button("🚀 PROCESAR TODO", type="primary", use_container_width=True):
         if api_key and model_choice and batches_data:
-            execute_processing(batches_data, api_key, model_choice, skip_dupes, delay, is_massive=True)
+            execute_processing(batches_data, api_key, model_choice, skip_dupes, delay, True)
         else: st.error("Faltan datos o API Key")
 
 # --- TAB 2: DASHBOARD ---
@@ -486,14 +498,11 @@ with tab2:
     if not df.empty or not df_err.empty:
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Total Analizados", len(df))
-        
         avg_score = df['puntaje'].mean() if not df.empty else 0
         k2.metric("Promedio", f"{avg_score:.2f}")
-        
         aprobados = len(df[df['recomendacion'].str.contains("AVANZA")]) if not df.empty else 0
         k3.metric("Aptos", aprobados)
-        
-        k4.metric("Fallidos/Errores", len(df_err), delta_color="inverse")
+        k4.metric("Errores", len(df_err), delta_color="inverse")
         
         if not df.empty:
             g1, g2 = st.columns(2)
@@ -501,9 +510,9 @@ with tab2:
             with g2: st.plotly_chart(px.pie(df, names='recomendacion'), use_container_width=True)
     else: st.info("Sin datos.")
 
-# --- TAB 3: DATOS (Excel y Errores) ---
+# --- TAB 3: DATOS ---
 with tab3:
-    st.header("🗃️ Base de Datos Completa")
+    st.header("🗃️ Base de Datos")
     df = db_load_all()
     df_err = db_load_errors()
     
@@ -513,24 +522,20 @@ with tab3:
             column_config={
                 "timestamp": st.column_config.DatetimeColumn("Hora", format="HH:mm:ss"),
                 "puntaje": st.column_config.ProgressColumn("Puntaje", format="%.2f", min_value=0, max_value=5),
-                "comentarios": st.column_config.TextColumn("Resumen Ejecutivo", width="large")
-            },
-            use_container_width=True,
-            hide_index=True
+                "comentarios": st.column_config.TextColumn("Resumen", width="large")
+            }, use_container_width=True, hide_index=True
         )
         
-        # Descarga EXCEL (.xlsx)
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             df.drop(columns=['pdf_blob', 'raw_json']).to_excel(writer, index=False, sheet_name='Resultados')
-            if not df_err.empty:
-                df_err.to_excel(writer, index=False, sheet_name='Errores')
+            if not df_err.empty: df_err.to_excel(writer, index=False, sheet_name='Errores')
                 
-        st.download_button("💾 Descargar Excel (.xlsx)", buffer.getvalue(), "Reporte_HR.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("💾 Descargar Excel", buffer.getvalue(), "Reporte_HR.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     else: st.info("Vacía.")
     
     if not df_err.empty:
-        with st.expander("❌ Registro de Errores y Archivos No Procesados", expanded=True):
+        with st.expander("❌ Registro de Errores", expanded=True):
             st.dataframe(df_err, use_container_width=True)
 
 # --- TAB 4: REPOSITORIO ---
@@ -541,7 +546,7 @@ with tab4:
         zip_mem = io.BytesIO()
         with zipfile.ZipFile(zip_mem, "w") as zf:
             for i, r in df.iterrows():
-                if r['pdf_blob']: zf.writestr(f"{r['candidato']}.pdf", r['pdf_blob'])
+                if r['pdf_blob']: zf.writestr(f"{re.sub(r'[^a-zA-Z0-9]', '_', str(r['candidato']))}.pdf", r['pdf_blob'])
         st.download_button("📦 Descargar ZIP", zip_mem.getvalue(), "Informes.zip", type="primary")
         
         for i, r in df.iterrows():
@@ -549,20 +554,18 @@ with tab4:
                 if r['pdf_blob']: st.download_button("PDF", r['pdf_blob'], f"{r['candidato']}.pdf", key=f"d{i}")
     else: st.info("Sin informes.")
 
-# --- TAB 5: REGISTRO ---
+# --- TAB 5: REGISTRO (NUEVA) ---
 with tab5:
-    st.header("📜 Historial de Ejecuciones")
+    st.header("📜 Historial de Lotes")
     df_logs = db_load_logs()
     if df_logs.empty:
-        st.info("No hay registros de procesos.")
+        st.info("Sin historial.")
     else:
         st.dataframe(
             df_logs,
             column_config={
                 "timestamp_inicio": st.column_config.DatetimeColumn("Inicio", format="DD/MM HH:mm"),
-                "duracion": "Duración",
-                "cantidad_archivos": "Archivos"
-            },
-            use_container_width=True,
-            hide_index=True
+                "timestamp_fin": st.column_config.DatetimeColumn("Fin", format="HH:mm:ss"),
+                "estado": st.column_config.TextColumn("Estado")
+            }, use_container_width=True, hide_index=True
         )
