@@ -12,7 +12,7 @@ from datetime import datetime
 from fpdf import FPDF
 import plotly.express as px
 
-# --- 1. CONFIGURACIÓN E INICIALIZACIÓN DEL ESTADO (LO PRIMERO) ---
+# --- 1. CONFIGURACIÓN E INICIALIZACIÓN ---
 st.set_page_config(
     page_title="HR Intelligence Suite",
     layout="wide",
@@ -20,7 +20,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Inicializar Base de Datos en Sesión si no existe
 if 'db' not in st.session_state:
     st.session_state.db = pd.DataFrame(columns=[
         'Fecha', 'Candidato', 'Facultad', 'Cargo', 'Nota', 
@@ -28,38 +27,18 @@ if 'db' not in st.session_state:
         'n_form', 'n_exp', 'n_comp', 'n_soft'
     ])
 
-# CSS PROFESIONAL (DARK MODE OPTIMIZED)
+# CSS PROFESIONAL
 st.markdown("""
     <style>
     .main { background-color: #0E1117; }
     h1, h2, h3 { color: #FAFAFA !important; font-family: 'Helvetica Neue', sans-serif; font-weight: 600; }
     p, label, li { color: #E0E0E0 !important; }
-    
-    /* TARJETAS DE LOTES */
-    .batch-card {
-        background-color: #262730;
-        border-radius: 8px;
-        padding: 15px;
-        margin-bottom: 15px;
-        border: 1px solid #363945;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-    }
-    .batch-header {
-        font-size: 1.1rem;
-        font-weight: bold;
-        color: white;
-        padding-bottom: 10px;
-        margin-bottom: 15px;
-        border-bottom: 1px solid #444;
-    }
-    
-    /* Bordes de Color */
+    .batch-card { background-color: #262730; border-radius: 8px; padding: 15px; margin-bottom: 15px; border: 1px solid #363945; }
+    .batch-header { font-size: 1.1rem; font-weight: bold; color: white; padding-bottom: 10px; margin-bottom: 15px; border-bottom: 1px solid #444; }
     .border-1 { border-top: 4px solid #3498db; }
     .border-2 { border-top: 4px solid #2ecc71; }
     .border-3 { border-top: 4px solid #e67e22; }
     .border-4 { border-top: 4px solid #9b59b6; }
-    
-    /* Botones y Tabs */
     .stButton>button { width: 100%; border-radius: 6px; font-weight: 600; }
     .stTabs [data-baseweb="tab-list"] { gap: 8px; }
     .stTabs [data-baseweb="tab"] { background-color: #262730; border: 1px solid #363945; }
@@ -67,7 +46,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. CONFIGURACIÓN DE RÚBRICA ---
+# --- 2. RÚBRICA ---
 RUBRICA = {
     "Docente": {
         "Formación": "35% | 5: PhD disciplina. 3-4: Magíster. 1-2: Diplomado.",
@@ -92,9 +71,8 @@ RUBRICA = {
 # --- 3. FUNCIONES DE LECTURA Y ANÁLISIS ---
 
 def read_file(file):
-    """Lee el archivo asegurando que el puntero esté al inicio."""
     try:
-        file.seek(0) # CORRECCIÓN CRÍTICA: Reiniciar puntero
+        file.seek(0)
         if file.type == "application/pdf":
             reader = PdfReader(file)
             text = ""
@@ -106,41 +84,56 @@ def read_file(file):
             return "\n".join([p.text for p in doc.paragraphs])
         return ""
     except Exception as e:
-        st.error(f"Error de lectura en {file.name}: {e}")
         return ""
 
 def analyze_gemini_safe(text, role, faculty, api_key):
-    """Analiza con Gemini y maneja errores de formato."""
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        crit = RUBRICA[role]
-        
-        prompt = f"""
-        Rol: Headhunter Senior. Analiza CV para {role} en {faculty}.
-        
-        RÚBRICA:
-        1. Formación: {crit['Formación']}
-        2. Experiencia: {crit['Experiencia']}
-        3. Competencias: {crit['Competencias']}
-        4. Software: {crit['Software']}
+    """
+    Intenta analizar con Gemini Flash. Si falla por versión/modelo,
+    hace fallback a Gemini Pro automáticamente.
+    """
+    genai.configure(api_key=api_key)
+    
+    crit = RUBRICA[role]
+    prompt = f"""
+    Rol: Headhunter Senior. Analiza CV para {role} en {faculty}.
+    RÚBRICA:
+    1. Formación: {crit['Formación']}
+    2. Experiencia: {crit['Experiencia']}
+    3. Competencias: {crit['Competencias']}
+    4. Software: {crit['Software']}
+    INSTRUCCIÓN: Devuelve SOLO JSON válido.
+    {{
+        "nombre": "Nombre Apellido",
+        "ajuste": "Alto/Medio/Bajo",
+        "razon": "Frase corta",
+        "rec": "Avanza/Dudoso/Descartado",
+        "n_form": 0.0, "n_exp": 0.0, "n_comp": 0.0, "n_soft": 0.0,
+        "comentarios": "Texto plano sin markdown."
+    }}
+    CV: {text[:15000]}
+    """
 
-        INSTRUCCIÓN: Devuelve SOLO JSON válido.
-        {{
-            "nombre": "Nombre Apellido",
-            "ajuste": "Alto/Medio/Bajo",
-            "razon": "Frase corta",
-            "rec": "Avanza/Dudoso/Descartado",
-            "n_form": 0.0, "n_exp": 0.0, "n_comp": 0.0, "n_soft": 0.0,
-            "comentarios": "Texto plano sin markdown."
-        }}
-        CV: {text[:15000]}
-        """
-        
-        response = model.generate_content(prompt)
+    # --- LÓGICA DE INTENTOS Y MODELOS ---
+    modelos_a_probar = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+    response = None
+    last_error = ""
+
+    for modelo_nombre in modelos_a_probar:
+        try:
+            model = genai.GenerativeModel(modelo_nombre)
+            response = model.generate_content(prompt)
+            break # Si funciona, salimos del loop
+        except Exception as e:
+            last_error = str(e)
+            continue # Si falla, probamos el siguiente
+
+    if not response:
+        st.error(f"Error de conexión con IA (Todos los modelos fallaron). Último error: {last_error}")
+        return None
+
+    # --- PROCESAMIENTO DE RESPUESTA ---
+    try:
         raw = response.text
-        
-        # Extracción segura de JSON
         start = raw.find('{')
         end = raw.rfind('}') + 1
         if start == -1 or end == 0: return None
@@ -149,7 +142,7 @@ def analyze_gemini_safe(text, role, faculty, api_key):
         try:
             data = json.loads(json_str)
         except:
-            data = eval(json_str) # Fallback
+            data = eval(json_str) 
             
         def val(k): return float(data.get(k, 0))
         final = val('n_form')*0.35 + val('n_exp')*0.30 + val('n_comp')*0.20 + val('n_soft')*0.15
@@ -160,10 +153,10 @@ def analyze_gemini_safe(text, role, faculty, api_key):
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
         }
     except Exception as e:
-        st.error(f"Error en Análisis IA: {str(e)}")
+        st.error(f"Error procesando datos: {str(e)}")
         return None
 
-# --- 4. GENERADOR DE PDF ---
+# --- 4. GENERADOR PDF ---
 class PDFReport(FPDF):
     def header(self):
         self.set_font('Arial', 'B', 14)
@@ -171,7 +164,6 @@ class PDFReport(FPDF):
         self.cell(0, 10, 'Informe Confidencial de Evaluación', 0, 1, 'L')
         self.line(10, 20, 200, 20)
         self.ln(10)
-    
     def footer(self):
         self.set_y(-15)
         self.set_font('Arial', 'I', 8)
@@ -221,9 +213,8 @@ def generate_pdf_bytes(data):
     pdf.multi_cell(0, 6, txt(data.get('comentarios', '')))
     return pdf.output(dest='S').encode('latin-1')
 
-# --- 5. LOGICA DE PROCESAMIENTO CENTRALIZADA ---
+# --- 5. LÓGICA DE PROCESAMIENTO ---
 def run_batch_process(files, faculty, role, api_key, status_container):
-    """Procesa una lista de archivos y actualiza el estado."""
     count = 0
     if not files: return 0
     
@@ -233,7 +224,7 @@ def run_batch_process(files, faculty, role, api_key, status_container):
             text = read_file(f)
             
             if len(text) < 50:
-                st.warning(f"⚠️ {f.name}: Archivo vacío o ilegible.")
+                st.warning(f"⚠️ {f.name}: Archivo vacío o imagen.")
                 continue
             
             st.text(f"🤖 Analizando: {f.name}...")
@@ -256,16 +247,14 @@ def run_batch_process(files, faculty, role, api_key, status_container):
                     "n_soft": res['n_soft'],
                     "PDF": pdf_bytes
                 }
-                # Guardar en Session State
                 st.session_state.db = pd.concat([st.session_state.db, pd.DataFrame([new_entry])], ignore_index=True)
                 count += 1
-                st.success(f"✅ {f.name} procesado (Nota: {res['final']})")
-            else:
-                st.error(f"❌ {f.name}: Falló el análisis de IA.")
+                st.success(f"✅ {f.name} OK (Nota: {res['final']})")
+            # Los errores ya se imprimen en analyze_gemini_safe
                 
     return count
 
-# --- 6. INTERFAZ ---
+# --- 6. INTERFAZ PRINCIPAL ---
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/9187/9187604.png", width=50)
     st.title("Admin Console")
@@ -277,28 +266,20 @@ with st.sidebar:
 
 st.markdown("## 🏢 HR Intelligence Suite")
 
-tab_load, tab_dash, tab_data, tab_repo = st.tabs([
-    "⚡ Procesamiento", "📊 Dashboard", "🗃️ Datos", "📂 PDFs"
-])
+tab_load, tab_dash, tab_data, tab_repo = st.tabs(["⚡ Procesamiento", "📊 Dashboard", "🗃️ Datos", "📂 PDFs"])
 
-# --- TAB 1: CARGA HÍBRIDA ROBUSTA ---
 with tab_load:
-    st.info("Configure los lotes. Puede procesar uno específico o todos a la vez.")
-    
-    # Grid de Lotes
+    st.info("Cargue sus CVs y seleccione perfiles.")
     col1, col2 = st.columns(2)
     
-    # Función para dibujar lote
     def draw_batch(col, idx, color_class):
         with col:
             st.markdown(f'<div class="batch-card {color_class}"><div class="batch-header">📂 Lote #{idx}</div>', unsafe_allow_html=True)
-            # USAR KEYS ÚNICAS para recuperar el estado luego
-            files = st.file_uploader(f"Archivos Lote {idx}", type=['pdf','docx'], key=f"u_{idx}", accept_multiple_files=True, label_visibility="collapsed")
+            files = st.file_uploader(f"Files {idx}", type=['pdf','docx'], key=f"u_{idx}", accept_multiple_files=True, label_visibility="collapsed")
             c_a, c_b = st.columns(2)
             fac = c_a.selectbox("Facultad", ["Ingeniería", "Economía", "Ciencias Vida", "Educación"], key=f"f_{idx}")
             rol = c_b.selectbox("Cargo", ["Docente", "Investigador", "Gestión Académica"], key=f"r_{idx}")
             
-            # Botón Individual
             if st.button(f"▶ Procesar Lote {idx}", key=f"btn_{idx}"):
                 if not api_key: st.error("Falta API Key")
                 elif not files: st.warning("Lote vacío")
@@ -316,37 +297,30 @@ with tab_load:
     draw_batch(col1, 3, "border-3")
     draw_batch(col2, 4, "border-4")
 
-    # BOTÓN MASIVO GLOBAL
     st.markdown("---")
     if st.button("🚀 PROCESAR TODOS LOS LOTES ACTIVOS", type="primary"):
         if not api_key:
-            st.error("🔑 Faltan credenciales (API Key).")
+            st.error("🔑 Faltan credenciales.")
         else:
             total = 0
             status_global = st.container()
-            
-            # Recuperar datos directamente del SESSION STATE para asegurar consistencia
-            # Iteramos del 1 al 4
             for i in range(1, 5):
                 files = st.session_state.get(f"u_{i}")
                 fac = st.session_state.get(f"f_{i}")
                 role = st.session_state.get(f"r_{i}")
-                
                 if files:
                     with status_global:
-                        st.markdown(f"**--- Iniciando Lote {i} ---**")
+                        st.markdown(f"**--- Lote {i} ---**")
                         n = run_batch_process(files, fac, role, api_key, status_global)
                         total += n
-            
             if total > 0:
                 st.balloons()
-                st.success(f"✅ Proceso Masivo Completado: {total} nuevos registros.")
+                st.success(f"✅ Masivo completado: {total} registros.")
                 time.sleep(2)
                 st.rerun()
             else:
-                st.warning("⚠️ No se encontraron archivos en ningún lote o falló el procesamiento.")
+                st.warning("⚠️ No hay archivos para procesar.")
 
-# --- TAB 2: DASHBOARD ---
 with tab_dash:
     df = st.session_state.db
     if not df.empty:
@@ -358,44 +332,37 @@ with tab_dash:
         st.markdown("---")
         g1, g2 = st.columns([2,1])
         with g1:
-            st.subheader("Puntajes por Facultad")
             fig = px.box(df, x="Facultad", y="Nota", color="Facultad", template="plotly_dark")
             fig.update_layout(paper_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig, use_container_width=True)
         with g2:
-            st.subheader("Decisión")
-            fig2 = px.pie(df, names="Estado", hole=0.4, color="Estado", template="plotly_dark",
-                          color_discrete_map={'Avanza':'#2ecc71', 'Dudoso':'#f1c40f', 'Descartado':'#e74c3c'})
+            fig2 = px.pie(df, names="Estado", hole=0.4, color="Estado", template="plotly_dark", color_discrete_map={'Avanza':'#2ecc71', 'Dudoso':'#f1c40f', 'Descartado':'#e74c3c'})
             fig2.update_layout(paper_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig2, use_container_width=True)
-        
-        st.subheader("Top Talent (>3.8)")
         st.dataframe(df[df['Nota']>=3.8][['Candidato','Cargo','Facultad','Nota','Estado']], hide_index=True, use_container_width=True)
     else:
-        st.info("Sin datos para mostrar.")
+        st.info("Sin datos.")
 
-# --- TAB 3: DATOS ---
 with tab_data:
     df = st.session_state.db
     if not df.empty:
         st.dataframe(df.drop(columns=['PDF', 'n_form', 'n_exp', 'n_comp', 'n_soft']), use_container_width=True)
     else:
-        st.info("Base de datos vacía.")
+        st.info("Vacío.")
 
-# --- TAB 4: PDFS ---
 with tab_repo:
     df = st.session_state.db
     if not df.empty:
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w") as zf:
             for i, r in df.iterrows():
-                clean_name = re.sub(r'[^a-zA-Z0-9]', '_', r['Candidato'])
-                zf.writestr(f"{clean_name}.pdf", r['PDF'])
+                clean = re.sub(r'[^a-zA-Z0-9]', '_', r['Candidato'])
+                zf.writestr(f"{clean}.pdf", r['PDF'])
         st.download_button("📦 Descargar ZIP", zip_buf.getvalue(), "Informes.zip", "application/zip", type="primary")
         st.markdown("---")
         for i, r in df.iterrows():
             c1, c2 = st.columns([4,1])
-            c1.write(f"📄 {r['Candidato']} ({r['Cargo']})")
-            c2.download_button("Descargar", r['PDF'], f"{r['Candidato']}.pdf", key=f"d_{i}")
+            c1.write(f"📄 {r['Candidato']}")
+            c2.download_button("Bajar", r['PDF'], f"{r['Candidato']}.pdf", key=f"d_{i}")
     else:
-        st.info("No hay informes generados.")
+        st.info("Sin informes.")
