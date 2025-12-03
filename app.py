@@ -12,7 +12,7 @@ from datetime import datetime
 from fpdf import FPDF
 import plotly.express as px
 
-# --- 1. CONFIGURACIÓN ---
+# --- 1. CONFIGURACIÓN E INICIALIZACIÓN ---
 st.set_page_config(
     page_title="HR Intelligence Suite",
     layout="wide",
@@ -20,6 +20,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Inicializar estado
 if 'db' not in st.session_state:
     st.session_state.db = pd.DataFrame(columns=[
         'Fecha', 'Candidato', 'Facultad', 'Cargo', 'Nota', 
@@ -27,7 +28,7 @@ if 'db' not in st.session_state:
         'n_form', 'n_exp', 'n_comp', 'n_soft'
     ])
 
-# CSS
+# CSS PROFESIONAL
 st.markdown("""
     <style>
     .main { background-color: #0E1117; }
@@ -68,8 +69,7 @@ RUBRICA = {
     }
 }
 
-# --- 3. FUNCIONES ---
-
+# --- 3. FUNCIONES DE LECTURA ---
 def read_file(file):
     try:
         file.seek(0)
@@ -85,10 +85,47 @@ def read_file(file):
         return ""
     except Exception: return ""
 
-def analyze_gemini_safe(text, role, faculty, api_key):
+# --- 4. MOTOR DE IA (SOLUCIÓN DEFINITIVA AUTODESCUBRIMIENTO) ---
+def get_best_model(api_key):
+    """
+    Consulta a Google qué modelos están disponibles y elige el mejor.
+    Evita errores 404 por nombres incorrectos.
+    """
     genai.configure(api_key=api_key)
+    try:
+        # 1. Obtener lista real de modelos disponibles para esta API Key
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available_models.append(m.name)
+        
+        # 2. Estrategia de selección (Prioridad: Flash > Pro > Cualquiera)
+        # Buscamos coincidencias parciales porque los nombres cambian (ej: models/gemini-1.5-flash-001)
+        for m in available_models:
+            if 'flash' in m.lower() and '1.5' in m: return m
+        for m in available_models:
+            if 'pro' in m.lower() and '1.5' in m: return m
+        for m in available_models:
+            if 'gemini-pro' in m.lower(): return m
+            
+        # 3. Si encontramos algo, devolvemos el primero
+        if available_models:
+            return available_models[0]
+        
+        return 'gemini-pro' # Fallback final
+        
+    except Exception as e:
+        # Si falla el listado, usamos el clásico seguro
+        return 'gemini-pro'
+
+def analyze_gemini_safe(text, role, faculty, api_key):
+    # Obtener el modelo correcto dinámicamente
+    model_name = get_best_model(api_key)
+    # st.toast(f"Usando modelo: {model_name}") # Descomentar para ver cuál usa
     
+    genai.configure(api_key=api_key)
     crit = RUBRICA[role]
+    
     prompt = f"""
     Rol: Headhunter Senior. Analiza CV para {role} en {faculty}.
     RÚBRICA:
@@ -108,31 +145,10 @@ def analyze_gemini_safe(text, role, faculty, api_key):
     CV: {text[:15000]}
     """
 
-    # --- LISTA DE MODELOS LIMPIA ---
-    # Eliminado 1.5-flash por error 404
-    # Priorizamos el experimental nuevo (2.0) y usamos 1.5 Pro como respaldo seguro
-    modelos = [
-        'gemini-2.0-flash-exp', 
-        'gemini-1.5-pro'
-    ]
-    
-    response = None
-    last_error = ""
-
-    for m_name in modelos:
-        try:
-            model = genai.GenerativeModel(m_name)
-            response = model.generate_content(prompt)
-            break 
-        except Exception as e:
-            last_error = str(e)
-            continue
-
-    if not response:
-        st.error(f"Error de conexión IA. Intenta actualizar 'requirements.txt'. Detalle: {last_error}")
-        return None
-
     try:
+        model = genai.GenerativeModel(model_name)
+        response = model.generate_content(prompt)
+        
         raw = response.text
         start = raw.find('{')
         end = raw.rfind('}') + 1
@@ -153,10 +169,11 @@ def analyze_gemini_safe(text, role, faculty, api_key):
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
         }
     except Exception as e:
-        st.error(f"Error procesando: {str(e)}")
+        # Si falla, imprimimos el error pero no rompemos la app
+        print(f"Error IA: {e}")
         return None
 
-# --- 4. PDF ---
+# --- 5. PDF REPORT ---
 class PDFReport(FPDF):
     def header(self):
         self.set_font('Arial', 'B', 14)
@@ -213,7 +230,7 @@ def generate_pdf_bytes(data):
     pdf.multi_cell(0, 6, txt(data.get('comentarios', '')))
     return pdf.output(dest='S').encode('latin-1')
 
-# --- 5. LÓGICA BATCH ---
+# --- 6. LOGICA BATCH ---
 def run_batch_process(files, faculty, role, api_key, status_container):
     count = 0
     if not files: return 0
@@ -250,10 +267,12 @@ def run_batch_process(files, faculty, role, api_key, status_container):
                 st.session_state.db = pd.concat([st.session_state.db, pd.DataFrame([new_entry])], ignore_index=True)
                 count += 1
                 st.success(f"✅ {f.name} OK")
+            else:
+                st.error(f"❌ {f.name}: Error IA (Verifica API Key)")
             
     return count
 
-# --- 6. INTERFAZ ---
+# --- 7. INTERFAZ ---
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/9187/9187604.png", width=50)
     st.title("Admin Console")
@@ -268,7 +287,7 @@ st.markdown("## 🏢 HR Intelligence Suite")
 tab_load, tab_dash, tab_data, tab_repo = st.tabs(["⚡ Procesamiento", "📊 Dashboard", "🗃️ Datos", "📂 PDFs"])
 
 with tab_load:
-    st.info("Cargue sus CVs. Puede procesar lotes individuales o todo junto.")
+    st.info("Cargue CVs y procese lotes.")
     col1, col2 = st.columns(2)
     
     def draw_batch(col, idx, color_class):
