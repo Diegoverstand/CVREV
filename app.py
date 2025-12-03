@@ -25,7 +25,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Estilos CSS (Sin alterar colores de fondo para evitar problemas de contraste)
 st.markdown("""
     <style>
     .main .block-container { padding-top: 1rem; }
@@ -40,32 +39,24 @@ st.markdown("""
 # ==============================================================================
 
 def get_api_key():
-    """Gestiona la obtención de la API Key priorizando Secrets."""
-    # 1. Intentar cargar desde Secrets
     if 'GOOGLE_API_KEY' in st.secrets:
-        return st.secrets['GOOGLE_API_KEY'], True # True = Es corporativa
-    
-    # 2. Si no hay secret, buscar en input de sesión
+        return st.secrets['GOOGLE_API_KEY'], True
     return st.session_state.get('user_api_key', ''), False
 
 def get_available_models(api_key):
-    """Consulta a Google qué modelos están realmente disponibles."""
     if not api_key: return []
-    
     genai.configure(api_key=api_key)
     try:
         model_list = []
         for m in genai.list_models():
             if 'generateContent' in m.supported_generation_methods:
-                # Limpiamos el nombre (ej: models/gemini-1.5-flash -> gemini-1.5-flash)
                 name = m.name.replace('models/', '')
                 model_list.append(name)
-        
-        # Ordenamos para que los 'flash' aparezcan primero (más rápidos)
-        model_list.sort(key=lambda x: 'flash' not in x)
+        # Ordenar: Flash primero
+        model_list.sort(key=lambda x: 'flash' not in x.lower())
         return model_list
-    except Exception as e:
-        return ["gemini-1.5-flash"] # Fallback seguro si falla la lista
+    except:
+        return ["gemini-1.5-flash"]
 
 # ==============================================================================
 # 3. BASE DE DATOS (PERSISTENCIA)
@@ -175,7 +166,7 @@ def analyze_with_gemini(text, role, faculty, api_key, model_choice):
         return None
 
 # ==============================================================================
-# 5. GENERADOR PDF
+# 5. GENERADOR PDF (CORREGIDO - ERROR SPACE)
 # ==============================================================================
 
 class PDFReport(FPDF):
@@ -187,8 +178,10 @@ class PDFReport(FPDF):
 def generate_pdf_report(data):
     pdf = PDFReport()
     pdf.add_page()
+    # Helper de encoding robusto
     def txt(s): return str(s).encode('latin-1', 'replace').decode('latin-1')
     
+    # Datos Generales
     pdf.set_font('Arial', 'B', 11); pdf.cell(30, 6, "Candidato:", 0, 0); pdf.set_font('Arial', '', 11)
     pdf.cell(0, 6, txt(data.get('nombre', 'N/A')), 0, 1)
     pdf.set_font('Arial', 'B', 11); pdf.cell(30, 6, "Cargo:", 0, 0); pdf.set_font('Arial', '', 11)
@@ -223,35 +216,94 @@ def generate_pdf_report(data):
     for n, p, v in dims:
         pdf.ln(8); pdf.cell(80, 8, txt(n), 1); pdf.cell(30, 8, p, 1, 0, 'C')
         pdf.cell(30, 8, str(v.get('nota', 0)), 1, 0, 'C'); pdf.cell(50, 8, f"{v.get('ponderado', 0):.2f}", 1, 0, 'C')
-    pdf.ln(8)
-    pdf.set_fill_color(230,230,230); pdf.set_font('Arial', 'B', 9)
-    pdf.cell(140, 8, "TOTAL PONDERADO", 1, 0, 'R', True); pdf.cell(50, 8, f"{data.get('puntaje_global', 0):.2f}", 1, 1, 'C', True)
     pdf.ln(10)
     
     # Cualitativo
     pdf.set_font('Arial', 'B', 12); pdf.set_fill_color(240, 240, 240)
     pdf.cell(0, 8, txt("C. ANÁLISIS CUALITATIVO"), 1, 1, 'L', True); pdf.ln(2)
     pdf.set_font('Arial', '', 10)
+    
     cual = data.get('analisis_cualitativo', {})
     for k, v in cual.items():
-        pdf.set_font('Arial', 'B', 10); pdf.cell(0, 6, txt(k.capitalize()), 0, 1); pdf.set_font('Arial', '', 10)
+        pdf.set_font('Arial', 'B', 10); pdf.cell(0, 6, txt(k.capitalize()), 0, 1)
+        pdf.set_font('Arial', '', 10)
         items = v if isinstance(v, list) else [str(v)]
-        for i in items: pdf.multi_cell(0, 5, txt(f"- {i}"))
-        pdf.ln(2)
         
+        # --- CORRECCIÓN DE ERROR FPDFException: Not enough horizontal space ---
+        for i in items:
+            # Aseguramos que el cursor esté en el margen izquierdo
+            pdf.set_x(10)
+            # Forzamos un ancho explícito (190mm) para evitar error w=0
+            pdf.multi_cell(190, 5, txt(f"- {i}"))
+        
+        pdf.ln(2)
+    
     return bytes(pdf.output())
 
 # ==============================================================================
-# 6. INTERFAZ DE USUARIO (SIDEBAR Y NAVEGACIÓN)
+# 6. LÓGICA DE PROCESAMIENTO
 # ==============================================================================
 
-# Obtener API Key y Estado
+def execute_processing(batches, api_key, model_choice, skip_dupes, delay_sec):
+    total_files = sum(len(b['files']) for b in batches)
+    
+    # UI Containers
+    progress_bar = st.progress(0, "Iniciando...")
+    status = st.empty()
+    live_table = st.empty()
+    
+    processed, skipped, errors = 0, 0, 0
+    current_idx = 0
+    
+    for batch in batches:
+        for file in batch['files']:
+            current_idx += 1
+            status.text(f"Procesando {current_idx}/{total_files}: {file.name}...")
+            
+            # 1. Duplicidad
+            file.seek(0); f_bytes = file.read(); f_hash = get_file_hash(f_bytes)
+            
+            if skip_dupes and db_check_exists(f_hash):
+                skipped += 1
+            else:
+                # 2. Análisis
+                file.seek(0)
+                text = read_file_safe(file)
+                if len(text) > 50:
+                    ai_res = analyze_with_gemini(text, batch['rol'], batch['fac'], api_key, model_choice)
+                    if ai_res:
+                        ai_res.update({'facultad': batch['fac'], 'cargo': batch['rol']})
+                        pdf = generate_pdf_report(ai_res)
+                        db_save_record(ai_res, pdf, f_hash, file.name, batch['id'])
+                        processed += 1
+                    else: errors += 1
+                else: errors += 1
+                
+                # 3. Freno de mano (Rate Limit)
+                time.sleep(delay_sec)
+            
+            # 4. Actualizar UI
+            progress_bar.progress(current_idx / total_files)
+            
+            if current_idx % 1 == 0:
+                with live_table.container():
+                    df = db_load_all()
+                    if not df.empty:
+                        st.dataframe(df.head(5)[['timestamp', 'candidato', 'puntaje', 'recomendacion']], use_container_width=True)
+
+    status.success(f"Finalizado. Nuevos: {processed} | Saltados: {skipped} | Errores: {errors}")
+    time.sleep(2)
+    st.rerun()
+
+# ==============================================================================
+# 7. INTERFAZ GRÁFICA
+# ==============================================================================
+
 api_key, is_corporate = get_api_key()
 
 with st.sidebar:
     st.header("⚙️ Configuración")
     
-    # 1. API Key (Solo se muestra si NO es corporativa)
     if is_corporate:
         st.success("✅ Licencia Corporativa Activa")
     else:
@@ -259,25 +311,24 @@ with st.sidebar:
         if user_input:
             st.session_state['user_api_key'] = user_input
             api_key = user_input
-            st.experimental_rerun()
+            st.rerun()
 
     st.divider()
     
-    # 2. Selector de Modelo (Dinámico)
+    # Selector de Modelo (Dinámico)
     st.subheader("🧠 Modelo de IA")
     if api_key:
         available_models = get_available_models(api_key)
         if available_models:
             model_choice = st.selectbox("Modelo Detectado:", available_models, index=0)
         else:
-            st.error("No se encontraron modelos. Verifique su API Key.")
+            st.error("Error al cargar modelos. Revise la API Key.")
             model_choice = None
     else:
-        st.warning("Ingrese API Key para cargar modelos.")
+        st.warning("Ingrese API Key para ver modelos.")
         model_choice = None
         
-    # Rate Limit Manual
-    req_delay = st.slider("Pausa entre análisis (seg)", 2, 20, 5, help="Aumentar para evitar errores de cuota.")
+    delay = st.slider("Pausa entre análisis (seg)", 2, 20, 5)
     
     st.divider()
     skip_dupes = st.checkbox("Omitir Duplicados", value=True)
@@ -286,83 +337,37 @@ with st.sidebar:
 
 st.title("🚀 HR Intelligence Suite")
 
-# TABS
 tab1, tab2, tab3, tab4 = st.tabs(["📥 Centro de Carga", "📊 Dashboard", "🗃️ Base de Datos", "📂 Repositorio"])
 
 FACULTADES = ["Facultad de Ingeniería", "Facultad de Economía y Negocios", "Facultad de Ciencias de la Vida", "Facultad de Educación y Ciencias Sociales"]
 CARGOS = ["Docente", "Investigador", "Gestión Académica"]
 
-# --- LÓGICA DE PROCESAMIENTO ---
-def run_processing(batches):
-    total_docs = sum(len(b['files']) for b in batches)
-    st.info(f"Iniciando análisis de {total_docs} documentos...")
-    
-    prog_bar = st.progress(0)
-    status_box = st.empty()
-    live_table_box = st.empty()
-    
-    processed, skipped, errors = 0, 0, 0
-    current = 0
-    
-    for b in batches:
-        for f in b['files']:
-            current += 1
-            status_box.text(f"Procesando {current}/{total_docs}: {f.name}")
-            
-            # Hash
-            f.seek(0); f_bytes = f.read(); f_hash = get_file_hash(f_bytes)
-            
-            if skip_dupes and db_check_exists(f_hash):
-                skipped += 1
-            else:
-                f.seek(0); text = read_file_safe(f)
-                if len(text) > 50:
-                    ai_res = analyze_with_gemini(text, b['rol'], b['fac'], api_key, model_choice)
-                    if ai_res:
-                        ai_res.update({'facultad': b['fac'], 'cargo': b['rol']})
-                        pdf = generate_pdf_report(ai_res)
-                        db_save_record(ai_res, pdf, f_hash, f.name, b['id'])
-                        processed += 1
-                        time.sleep(req_delay)
-                    else: errors += 1
-                else: errors += 1
-            
-            prog_bar.progress(current / total_docs)
-            
-            # Update Tabla en Vivo
-            if current % 1 == 0:
-                with live_table_box.container():
-                    df = db_load_all()
-                    if not df.empty: st.dataframe(df.head(5)[['candidato', 'puntaje', 'recomendacion']], use_container_width=True)
-
-    status_box.success(f"Fin: {processed} Nuevos | {skipped} Duplicados | {errors} Errores")
-    time.sleep(2); st.rerun()
-
-# --- TAB 1: CARGA ---
+# --- TAB 1: Carga ---
 with tab1:
-    c1, c2 = st.columns(2)
+    col_a, col_b = st.columns(2)
     batches_data = []
     
     def render_batch(col, idx):
         with col, st.container(border=True):
             st.subheader(f"📂 Lote #{idx}")
             files = st.file_uploader(f"Docs {idx}", accept_multiple_files=True, key=f"u{idx}")
-            fac = st.selectbox("Facultad", FACULTADES, key=f"f{idx}")
+            fac = st.selectbox("Facultad", FACULTADES, key=f"fac{idx}")
             rol = st.selectbox("Cargo", CARGOS, key=f"r{idx}")
             
             if st.button(f"▶ Procesar Lote {idx}", key=f"b{idx}"):
                 if api_key and model_choice and files:
-                    run_processing([{'id': f"Lote {idx}", 'files': files, 'fac': fac, 'rol': rol}])
+                    execute_processing([{'id': f"Lote {idx}", 'files': files, 'fac': fac, 'rol': rol}], api_key, model_choice, skip_dupes, delay)
                 else: st.error("Verifique Configuración")
             
             if files: batches_data.append({'id': f"Lote {idx}", 'files': files, 'fac': fac, 'rol': rol})
 
-    render_batch(c1, 1); render_batch(c2, 2)
-    render_batch(c1, 3); render_batch(c2, 4)
+    render_batch(col_a, 1); render_batch(col_b, 2)
+    render_batch(col_a, 3); render_batch(col_b, 4)
     
     st.markdown("---")
     if st.button("🚀 PROCESAR TODO", type="primary", use_container_width=True):
-        if api_key and model_choice and batches_data: run_processing(batches_data)
+        if api_key and model_choice and batches_data:
+            execute_processing(batches_data, api_key, model_choice, skip_dupes, delay)
         else: st.error("Faltan datos o API Key")
 
 # --- TAB 2: DASHBOARD ---
@@ -372,7 +377,7 @@ with tab2:
     if not df.empty:
         k1, k2, k3 = st.columns(3)
         k1.metric("Total", len(df)); k2.metric("Promedio", f"{df['puntaje'].mean():.2f}")
-        k3.metric("Aptos", len(df[df['recomendacion'] == "AVANZA"]))
+        k3.metric("Aptos", len(df[df['recomendacion'].str.contains("AVANZA")]))
         
         g1, g2 = st.columns(2)
         with g1: st.plotly_chart(px.box(df, x='facultad', y='puntaje', color='facultad'), use_container_width=True)
