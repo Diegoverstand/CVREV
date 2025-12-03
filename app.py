@@ -20,7 +20,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Inicializar estado
 if 'db' not in st.session_state:
     st.session_state.db = pd.DataFrame(columns=[
         'Fecha', 'Candidato', 'Facultad', 'Cargo', 'Nota', 
@@ -85,22 +84,16 @@ def read_file(file):
         return ""
     except Exception: return ""
 
-# --- 4. MOTOR DE IA (SOLUCIÓN DEFINITIVA AUTODESCUBRIMIENTO) ---
+# --- 4. MOTOR DE IA (AUTODESCUBRIMIENTO) ---
 def get_best_model(api_key):
-    """
-    Consulta a Google qué modelos están disponibles y elige el mejor.
-    Evita errores 404 por nombres incorrectos.
-    """
     genai.configure(api_key=api_key)
     try:
-        # 1. Obtener lista real de modelos disponibles para esta API Key
         available_models = []
         for m in genai.list_models():
             if 'generateContent' in m.supported_generation_methods:
                 available_models.append(m.name)
         
-        # 2. Estrategia de selección (Prioridad: Flash > Pro > Cualquiera)
-        # Buscamos coincidencias parciales porque los nombres cambian (ej: models/gemini-1.5-flash-001)
+        # Prioridad: Flash > Pro > Cualquiera
         for m in available_models:
             if 'flash' in m.lower() and '1.5' in m: return m
         for m in available_models:
@@ -108,21 +101,13 @@ def get_best_model(api_key):
         for m in available_models:
             if 'gemini-pro' in m.lower(): return m
             
-        # 3. Si encontramos algo, devolvemos el primero
-        if available_models:
-            return available_models[0]
+        return available_models[0] if available_models else 'gemini-pro'
         
-        return 'gemini-pro' # Fallback final
-        
-    except Exception as e:
-        # Si falla el listado, usamos el clásico seguro
+    except Exception:
         return 'gemini-pro'
 
 def analyze_gemini_safe(text, role, faculty, api_key):
-    # Obtener el modelo correcto dinámicamente
     model_name = get_best_model(api_key)
-    # st.toast(f"Usando modelo: {model_name}") # Descomentar para ver cuál usa
-    
     genai.configure(api_key=api_key)
     crit = RUBRICA[role]
     
@@ -169,11 +154,10 @@ def analyze_gemini_safe(text, role, faculty, api_key):
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
         }
     except Exception as e:
-        # Si falla, imprimimos el error pero no rompemos la app
         print(f"Error IA: {e}")
         return None
 
-# --- 5. PDF REPORT ---
+# --- 5. PDF REPORT (CORREGIDO PARA FPDF2) ---
 class PDFReport(FPDF):
     def header(self):
         self.set_font('Arial', 'B', 14)
@@ -190,6 +174,8 @@ class PDFReport(FPDF):
 def generate_pdf_bytes(data):
     pdf = PDFReport()
     pdf.add_page()
+    
+    # Helper para encoding (solo para el texto que entra al PDF)
     def txt(s): return str(s).encode('latin-1', 'replace').decode('latin-1')
     
     pdf.set_font('Arial', 'B', 16)
@@ -228,7 +214,11 @@ def generate_pdf_bytes(data):
         
     pdf.ln(10)
     pdf.multi_cell(0, 6, txt(data.get('comentarios', '')))
-    return pdf.output(dest='S').encode('latin-1')
+    
+    # --- CORRECCIÓN CRÍTICA AQUÍ ---
+    # En fpdf2 moderno, output() retorna un bytearray directamente.
+    # No usamos .encode('latin-1') sobre el resultado final.
+    return bytes(pdf.output()) 
 
 # --- 6. LOGICA BATCH ---
 def run_batch_process(files, faculty, role, api_key, status_container):
@@ -248,7 +238,9 @@ def run_batch_process(files, faculty, role, api_key, status_container):
             res = analyze_gemini_safe(text, role, faculty, api_key)
             
             if res:
+                # Aquí llamamos a la función corregida generate_pdf_bytes
                 pdf_bytes = generate_pdf_bytes({**res, "facultad": faculty, "cargo": role})
+                
                 new_entry = {
                     "Fecha": res['timestamp'],
                     "Candidato": res['nombre'],
@@ -268,7 +260,7 @@ def run_batch_process(files, faculty, role, api_key, status_container):
                 count += 1
                 st.success(f"✅ {f.name} OK")
             else:
-                st.error(f"❌ {f.name}: Error IA (Verifica API Key)")
+                st.error(f"❌ {f.name}: Error en análisis IA.")
             
     return count
 
@@ -287,7 +279,7 @@ st.markdown("## 🏢 HR Intelligence Suite")
 tab_load, tab_dash, tab_data, tab_repo = st.tabs(["⚡ Procesamiento", "📊 Dashboard", "🗃️ Datos", "📂 PDFs"])
 
 with tab_load:
-    st.info("Cargue CVs y procese lotes.")
+    st.info("Cargue sus CVs y procese lotes.")
     col1, col2 = st.columns(2)
     
     def draw_batch(col, idx, color_class):
