@@ -15,39 +15,55 @@ from fpdf import FPDF
 import plotly.express as px
 
 # ==============================================================================
-# 1. CONFIGURACIÓN INICIAL Y ESTILOS
+# 1. CONFIGURACIÓN DEL ENTORNO Y ESTILOS (UI/UX)
 # ==============================================================================
 
 st.set_page_config(
-    page_title="HR Intelligence Suite Pro",
+    page_title="HR Intelligence Suite",
     layout="wide",
-    page_icon="🏢",
+    page_icon="🎓",
     initial_sidebar_state="expanded"
 )
 
-# Estilos CSS Nativos (Se adaptan a Tema Claro/Oscuro)
+# CSS Nativo y Limpio: Se adapta automáticamente al tema Claro/Oscuro del usuario.
+# No forzamos colores de fondo para evitar problemas de contraste.
 st.markdown("""
     <style>
-    .main .block-container { padding-top: 2rem; }
+    .main .block-container { padding-top: 1rem; }
+    /* Ajuste de Tabs */
     .stTabs [data-baseweb="tab-list"] { gap: 10px; }
     .stTabs [data-baseweb="tab"] { height: 50px; border-radius: 5px; }
-    div[data-testid="stExpander"] { border: 1px solid #444; border-radius: 5px; }
+    /* Ajuste de Contenedores */
+    div[data-testid="stExpander"] { border: 1px solid #4a4a4a; border-radius: 5px; }
     </style>
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# 2. DEFINICIÓN DE HERRAMIENTAS Y FUNCIONES CORE
+# 2. CAPA DE PERSISTENCIA (SQLite)
 # ==============================================================================
 
-# --- Capa de Datos (SQLite) ---
 @st.cache_resource
 def init_db():
+    """
+    Inicializa la conexión a la Base de Datos.
+    Usamos cache_resource para mantener una única conexión abierta y evitar bloqueos.
+    """
     conn = sqlite3.connect('cv_master_db.db', check_same_thread=False)
     c = conn.cursor()
+    # Tabla Única Consolidada
     c.execute('''CREATE TABLE IF NOT EXISTS analisis (
-                    file_hash TEXT PRIMARY KEY, timestamp TEXT, lote_nombre TEXT, archivo_nombre TEXT,
-                    candidato TEXT, facultad TEXT, cargo TEXT, puntaje REAL, recomendacion TEXT,
-                    ajuste TEXT, raw_json TEXT, pdf_blob BLOB
+                    file_hash TEXT PRIMARY KEY,
+                    timestamp TEXT,
+                    lote_nombre TEXT,
+                    archivo_nombre TEXT,
+                    candidato TEXT,
+                    facultad TEXT,
+                    cargo TEXT,
+                    puntaje REAL,
+                    recomendacion TEXT,
+                    ajuste TEXT,
+                    raw_json TEXT,
+                    pdf_blob BLOB
                 )''')
     conn.commit()
     return conn
@@ -55,68 +71,94 @@ def init_db():
 conn = init_db()
 
 def get_file_hash(file_bytes):
+    """Genera huella digital MD5 para detectar duplicados exactos."""
     return hashlib.md5(file_bytes).hexdigest()
 
 def db_check_exists(file_hash):
+    """Verifica si el hash ya existe en la BD."""
     c = conn.cursor()
     c.execute("SELECT candidato FROM analisis WHERE file_hash = ?", (file_hash,))
     return c.fetchone() is not None
 
 def db_save_record(data_dict, pdf_bytes, file_hash, filename, lote_name):
+    """Guarda o actualiza (UPSERT) un registro."""
     c = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     json_str = json.dumps(data_dict, ensure_ascii=False)
+    
+    # Manejo seguro de valores nulos
+    puntaje = float(data_dict.get('puntaje_global', 0.0))
+    
     c.execute('''INSERT OR REPLACE INTO analisis VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-              (file_hash, now, lote_name, filename, data_dict.get('nombre'),
-               data_dict.get('facultad'), data_dict.get('cargo'), data_dict.get('puntaje_global'),
-               data_dict.get('recomendacion'), data_dict.get('ajuste'), json_str, pdf_bytes))
+              (file_hash, now, lote_name, filename, 
+               data_dict.get('nombre', 'Desconocido'),
+               data_dict.get('facultad', ''), 
+               data_dict.get('cargo', ''),
+               puntaje,
+               data_dict.get('recomendacion', 'N/A'),
+               data_dict.get('ajuste', 'N/A'),
+               json_str, pdf_bytes))
     conn.commit()
 
 def db_load_all():
+    """Carga todo el historial para el Dashboard."""
     return pd.read_sql("SELECT * FROM analisis ORDER BY timestamp DESC", conn)
 
-# --- Motores de Lectura y IA ---
+# ==============================================================================
+# 3. MOTORES DE LECTURA Y ANÁLISIS (IA)
+# ==============================================================================
+
 def read_file_safe(file_obj):
+    """Lee PDF o DOCX reiniciando el puntero para evitar errores de lectura vacía."""
     try:
         file_obj.seek(0)
-        if file_obj.name.endswith('.pdf'):
+        if file_obj.name.lower().endswith('.pdf'):
             reader = PdfReader(file_obj)
-            return "".join([p.extract_text() or "" for p in reader.pages])
-        elif file_obj.name.endswith('.docx'):
+            text = ""
+            for page in reader.pages:
+                text += page.extract_text() or ""
+            return text
+        elif file_obj.name.lower().endswith('.docx'):
             doc = Document(file_obj)
             return "\n".join([p.text for p in doc.paragraphs])
         return ""
-    except Exception: return ""
+    except Exception as e:
+        return "" # Retorna vacío en caso de error para manejarlo arriba
 
-def analyze_with_ai(text, role, faculty, api_key):
+def analyze_with_gemini(text, role, faculty, api_key, model_choice):
+    """
+    Motor de IA con Prompt Engineering Estricto.
+    """
     if not api_key: return None
     genai.configure(api_key=api_key)
     
-    # Lógica de Autodescubrimiento de Modelo
-    model_name = 'gemini-1.5-flash' # Default
-    try:
-        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        for m in models:
-            if 'flash' in m.lower() and ('1.5' in m or '2.0' in m):
-                model_name = m; break
-    except: pass
-    
+    # 1. Definición de Reglas de Negocio
     prompt = f"""
-    Eres un experto en Selección Académica. Evalúa este CV.
-    Facultad: {faculty} | Cargo: {role}
-    Reglas:
-    1. Calcula el puntaje de cada dimensión (0-5).
-    2. Calcula el Puntaje Ponderado (Formación: 35%, Experiencia: 30%, Competencias: 20%, Software: 15%).
-    3. Suma para el Puntaje Global (0.00-5.00).
-    4. Asigna Recomendación: 'AVANZA' (>=3.75), 'REQUIERE ANTECEDENTES' (3.00-3.74), 'NO RECOMENDADO' (<3.00).
+    Actúa como un Consultor Experto en Selección Académica. Analiza el siguiente CV.
     
-    Output JSON (Estricto):
+    CONTEXTO:
+    - Facultad: {faculty}
+    - Cargo: {role}
+    
+    RÚBRICA DE PONDERACIÓN:
+    1. Formación Académica (35%)
+    2. Experiencia Laboral (30%)
+    3. Competencias Técnicas (20%)
+    4. Herramientas y Software (15%)
+    
+    REGLAS DE RECOMENDACIÓN (Estrictas):
+    - Si Puntaje Global >= 3.75 -> "AVANZA"
+    - Si Puntaje Global entre 3.00 y 3.74 -> "REQUIERE ANTECEDENTES"
+    - Si Puntaje Global < 3.00 -> "NO RECOMENDADO"
+    
+    FORMATO DE SALIDA (JSON ÚNICAMENTE):
+    Debes devolver un JSON válido con esta estructura exacta. Sin markdown, sin texto extra.
     {{
-        "nombre": "Nombre Completo",
-        "ajuste": "Alto/Medio/Bajo",
-        "puntaje_global": 0.00,
-        "recomendacion": "ESTADO",
-        "conclusion_ejecutiva": "Resumen ejecutivo.",
+        "nombre": "Nombre y Apellido del Candidato",
+        "ajuste": "ALTO / MEDIO / BAJO",
+        "puntaje_global": 0.00,  // Float con 2 decimales
+        "recomendacion": "AVANZA / REQUIERE ANTECEDENTES / NO RECOMENDADO",
+        "conclusion_ejecutiva": "Resumen de 1 párrafo justificando la decisión.",
         "detalle_puntajes": {{
             "formacion": {{ "nota": 0, "ponderado": 0.00 }},
             "experiencia": {{ "nota": 0, "ponderado": 0.00 }},
@@ -124,241 +166,391 @@ def analyze_with_ai(text, role, faculty, api_key):
             "software": {{ "nota": 0, "ponderado": 0.00 }}
         }},
         "analisis_cualitativo": {{
-            "brechas": ["..."], "riesgos": ["..."], "fortalezas": ["..."]
+            "brechas": ["Punto 1", "Punto 2"],
+            "riesgos": ["Punto 1", "Punto 2"],
+            "fortalezas": ["Punto 1", "Punto 2"]
         }}
     }}
-    CV TEXTO: {text[:30000]}
+    
+    DOCUMENTO A ANALIZAR:
+    {text[:30000]}
     """
     
     try:
-        model = genai.GenerativeModel(model_name)
+        model = genai.GenerativeModel(model_choice)
         response = model.generate_content(prompt)
+        
+        # Limpieza de respuesta (JSON Sanitization)
         raw = response.text
-        start, end = raw.find('{'), raw.rfind('}') + 1
-        return json.loads(raw[start:end]) if start != -1 else None
+        start = raw.find('{')
+        end = raw.rfind('}') + 1
+        if start == -1: return None
+        
+        return json.loads(raw[start:end])
     except Exception as e:
-        st.error(f"Fallo en IA ({model_name}): {e}")
+        print(f"Error IA: {e}")
         return None
 
-# --- Generador de PDF Corporativo ---
+# ==============================================================================
+# 4. MOTOR DE REPORTES (PDF Pixel-Perfect)
+# ==============================================================================
+
 class PDFReport(FPDF):
     def header(self):
-        self.set_font('Arial', 'B', 14); self.cell(0, 10, 'INFORME DE AJUSTE CANDIDATO-CARGO', 0, 1, 'C'); self.ln(5)
+        self.set_font('Arial', 'B', 14)
+        self.cell(0, 10, 'INFORME DE AJUSTE CANDIDATO-CARGO', 0, 1, 'C')
+        self.line(10, 20, 200, 20)
+        self.ln(10)
+    
     def footer(self):
-        self.set_y(-15); self.set_font('Arial', 'I', 8); self.cell(0, 10, f'Pagina {self.page_no()}', 0, 0, 'C')
+        self.set_y(-15)
+        self.set_font('Arial', 'I', 8)
+        self.set_text_color(128)
+        self.cell(0, 10, f'Generado el {datetime.now().strftime("%d/%m/%Y")}', 0, 0, 'C')
 
 def generate_pdf_report(data):
     pdf = PDFReport()
     pdf.add_page()
+    
+    # Helper para codificación Latin-1 (Tildes/Ñ)
     def txt(s): return str(s).encode('latin-1', 'replace').decode('latin-1')
     
-    pdf.set_font('Arial', 'B', 11); pdf.cell(30, 6, "Candidato:", 0, 0); pdf.set_font('Arial', '', 11)
-    pdf.cell(0, 6, txt(data.get('nombre', '')), 0, 1)
-    pdf.set_font('Arial', 'B', 11); pdf.cell(30, 6, "Cargo:", 0, 0); pdf.set_font('Arial', '', 11)
-    pdf.cell(0, 6, txt(f"{data.get('cargo')} / {data.get('facultad')}"), 0, 1); pdf.ln(8)
+    # 1. Encabezado de Datos
+    pdf.set_font('Arial', 'B', 11); pdf.cell(30, 6, "Candidato:", 0, 0)
+    pdf.set_font('Arial', '', 11); pdf.cell(0, 6, txt(data.get('nombre', 'N/A')), 0, 1)
     
-    pdf.set_font('Arial', 'B', 12); pdf.set_fill_color(240, 240, 240)
-    pdf.cell(0, 8, txt("A. CONCLUSIÓN EJECUTIVA"), 1, 1, 'L', True); pdf.ln(2)
+    pdf.set_font('Arial', 'B', 11); pdf.cell(30, 6, "Cargo:", 0, 0)
+    pdf.set_font('Arial', '', 11); pdf.cell(0, 6, txt(f"{data.get('cargo')} - {data.get('facultad')}"), 0, 1)
+    pdf.ln(8)
+    
+    # 2. Sección A: Ejecutiva
+    pdf.set_font('Arial', 'B', 12)
+    pdf.set_fill_color(240, 240, 240)
+    pdf.cell(0, 8, txt("A. CONCLUSIÓN EJECUTIVA"), 1, 1, 'L', True)
+    pdf.ln(2)
+    
     pdf.set_font('Arial', '', 10)
-    pdf.multi_cell(0, 5, txt(f"Nivel de ajuste: {data.get('ajuste')}. Puntaje: {data.get('puntaje_global', 0.0):.2f}/5.00.\n{data.get('conclusion_ejecutiva')}")); pdf.ln(5)
+    resumen = f"Nivel de Ajuste: {data.get('ajuste')}. Puntaje Global: {data.get('puntaje_global', 0):.2f} / 5.00.\n{data.get('conclusion_ejecutiva')}"
+    pdf.multi_cell(0, 5, txt(resumen))
+    pdf.ln(5)
     
+    # Caja de Recomendación (Semáforo)
     rec = data.get('recomendacion', '').upper()
-    if "NO" in rec: pdf.set_fill_color(255, 200, 200)
-    elif "AVANZA" in rec: pdf.set_fill_color(200, 255, 200)
-    else: pdf.set_fill_color(255, 255, 200)
-    pdf.set_font('Arial', 'B', 12); pdf.cell(0, 10, txt(rec), 1, 1, 'C', True); pdf.ln(8)
+    if "NO" in rec:
+        pdf.set_fill_color(255, 200, 200) # Rojo
+        pdf.set_text_color(150, 0, 0)
+    elif "AVANZA" in rec:
+        pdf.set_fill_color(200, 255, 200) # Verde
+        pdf.set_text_color(0, 100, 0)
+    else:
+        pdf.set_fill_color(255, 255, 200) # Amarillo
+        pdf.set_text_color(100, 100, 0)
+        
+    pdf.set_font('Arial', 'B', 12)
+    pdf.cell(0, 10, txt(rec), 1, 1, 'C', True)
     
-    pdf.set_font('Arial', 'B', 12); pdf.set_fill_color(240, 240, 240)
+    pdf.set_text_color(0) # Reset
+    pdf.ln(10)
+    
+    # 3. Sección B: Tabla
+    pdf.set_font('Arial', 'B', 12)
+    pdf.set_fill_color(240, 240, 240)
     pdf.cell(0, 8, txt("B. TABLA RESUMEN DE CALIFICACIÓN"), 1, 1, 'L', True)
-    pdf.set_font('Arial', 'B', 9); pdf.set_fill_color(50, 50, 50); pdf.set_text_color(255)
-    pdf.cell(80, 8, "Dimensión", 1, 0, 'L', True); pdf.cell(30, 8, "Ponderación", 1, 0, 'C', True)
-    pdf.cell(30, 8, "Puntaje (0-5)", 1, 0, 'C', True); pdf.cell(50, 8, "Puntaje Ponderado", 1, 1, 'C', True)
+    
+    # Encabezados
+    pdf.set_font('Arial', 'B', 9)
+    pdf.set_fill_color(50, 50, 50); pdf.set_text_color(255)
+    pdf.cell(80, 8, "Variable", 1, 0, 'L', True)
+    pdf.cell(30, 8, "Ponderación", 1, 0, 'C', True)
+    pdf.cell(30, 8, "Nota (0-5)", 1, 0, 'C', True)
+    pdf.cell(50, 8, "Puntaje Ponderado", 1, 1, 'C', True)
     pdf.set_text_color(0); pdf.set_font('Arial', '', 9)
     
     det = data.get('detalle_puntajes', {})
-    dims = [("Formación", "35%", det.get('formacion', {})), ("Experiencia", "30%", det.get('experiencia', {})),
-            ("Competencias", "20%", det.get('competencias', {})), ("Software", "15%", det.get('software', {}))]
+    dims = [
+        ("Formación Académica", "35%", det.get('formacion', {})),
+        ("Experiencia Laboral", "30%", det.get('experiencia', {})),
+        ("Competencias Técnicas", "20%", det.get('competencias', {})),
+        ("Herramientas y Software", "15%", det.get('software', {}))
+    ]
+    
     for n, p, v in dims:
-        pdf.cell(80, 8, txt(n), 1); pdf.cell(30, 8, p, 1, 0, 'C'); pdf.cell(30, 8, str(v.get('nota', 0)), 1, 0, 'C'); pdf.cell(50, 8, f"{v.get('ponderado', 0):.2f}", 1, 1, 'C')
+        pdf.ln(8)
+        pdf.cell(80, 8, txt(n), 1)
+        pdf.cell(30, 8, p, 1, 0, 'C')
+        pdf.cell(30, 8, str(v.get('nota', 0)), 1, 0, 'C')
+        pdf.cell(50, 8, f"{v.get('ponderado', 0):.2f}", 1, 0, 'C')
+        
+    pdf.ln(8)
+    pdf.set_fill_color(230, 230, 230)
+    pdf.set_font('Arial', 'B', 9)
+    pdf.cell(140, 8, "TOTAL PONDERADO", 1, 0, 'R', True)
+    pdf.cell(50, 8, f"{data.get('puntaje_global', 0):.2f}", 1, 1, 'C', True)
+    pdf.ln(10)
     
-    pdf.set_font('Arial', 'B', 9); pdf.set_fill_color(230,230,230)
-    pdf.cell(140, 8, "TOTAL PONDERADO", 1, 0, 'R', True); pdf.cell(50, 8, f"{data.get('puntaje_global', 0.0):.2f} / 5.00", 1, 1, 'C', True); pdf.ln(8)
+    # 4. Sección C: Cualitativo
+    pdf.set_font('Arial', 'B', 12)
+    pdf.set_fill_color(240, 240, 240)
+    pdf.cell(0, 8, txt("C. ANÁLISIS CUALITATIVO"), 1, 1, 'L', True)
+    pdf.ln(2)
     
-    pdf.set_font('Arial', 'B', 12); pdf.set_fill_color(240, 240, 240)
-    pdf.cell(0, 8, txt("C. COMENTARIOS FINALES"), 1, 1, 'L', True); pdf.ln(2)
-    pdf.set_font('Arial', '', 10)
     cual = data.get('analisis_cualitativo', {})
     for k, v in cual.items():
-        pdf.set_font('Arial', 'B', 10); pdf.cell(0, 6, txt(k.capitalize()), 0, 1)
+        pdf.set_font('Arial', 'B', 10)
+        pdf.cell(0, 6, txt(k.upper().replace("_", " ")), 0, 1)
         pdf.set_font('Arial', '', 10)
         items = v if isinstance(v, list) else [str(v)]
-        for i in items: pdf.multi_cell(0, 5, txt(f"- {i}"))
+        for i in items:
+            pdf.multi_cell(0, 5, txt(f"- {i}"))
         pdf.ln(2)
         
     return bytes(pdf.output())
 
-# --- Lógica de Procesamiento Centralizada ---
-def execute_processing(batches_to_run, api_key, skip_dupes):
-    total_files = sum(len(b['files']) for b in batches_to_run)
-    est_time = total_files * 5
-    st.info(f"⏱️ Analizando {total_files} documentos... Tiempo estimado: ~{est_time // 60} min {est_time % 60} seg.")
-    
-    progress_bar = st.progress(0, "Iniciando...")
-    status_log_placeholder = st.empty()
-    live_table_placeholder = st.empty()
-    
-    processed, skipped, errors = 0, 0, 0
-    log_messages = []
-
-    for batch in batches_to_run:
-        for file in batch['files']:
-            # 1. Hashear y verificar duplicidad
-            file.seek(0); file_bytes = file.read(); file_hash = get_file_hash(file_bytes)
-            
-            if skip_dupes and db_check_exists(file_hash):
-                skipped += 1
-            else:
-                # 2. Leer y Analizar
-                text = read_file_safe(file)
-                if len(text) > 50:
-                    ai_data = analyze_with_ai(text, batch['rol'], batch['fac'], api_key)
-                    if ai_data:
-                        # 3. Guardar
-                        ai_data.update({'facultad': batch['fac'], 'cargo': batch['rol']})
-                        pdf_bytes = generate_pdf_report(ai_data)
-                        db_save_record(ai_data, pdf_bytes, file_hash, file.name, batch['id'])
-                        processed += 1
-                    else: errors += 1
-                else: errors += 1
-            
-            # 4. Actualizar UI
-            completed = processed + skipped + errors
-            progress_bar.progress(completed / total_files, f"Progreso: {completed}/{total_files}")
-            if processed > 0: log_messages.append(f"✅ {file.name}")
-            elif skipped > 0 and skip_dupes and db_check_exists(file_hash): log_messages.append(f"🔄 {file.name} (Duplicado)")
-            else: log_messages.append(f"❌ {file.name} (Error)")
-            status_log_placeholder.info("\n".join(log_messages[-5:])) # Últimos 5 logs
-            
-            # Streaming en vivo a la tabla de la pestaña de Datos
-            with live_table_placeholder.container():
-                df_live = db_load_all()
-                if not df_live.empty:
-                    st.dataframe(df_live.head(10)[['timestamp', 'lote_nombre', 'candidato', 'puntaje', 'recomendacion']], use_container_width=True)
-
-    st.success(f"Finalizado. Nuevos: {processed}, Omitidos: {skipped}, Errores: {errors}")
-    time.sleep(3); st.rerun()
-
 # ==============================================================================
-# 6. INTERFAZ GRÁFICA (UI)
+# 5. LÓGICA DE INTERFAZ Y ORQUESTACIÓN
 # ==============================================================================
 
-# --- Sidebar ---
+# --- SIDEBAR CONFIG ---
 with st.sidebar:
-    st.title("⚙️ Panel de Control")
+    st.header("⚙️ Configuración")
+    
+    # API Key con fallback a secrets
     api_key = st.text_input("Google API Key", type="password")
     if 'GOOGLE_API_KEY' in st.secrets:
         api_key = st.secrets['GOOGLE_API_KEY']
-        st.success("Licencia Corporativa Activa")
-    
-    st.divider()
-    skip_dupes = st.checkbox("Omitir duplicados", value=True)
-    if st.button("🔴 Borrar Historial"):
-        conn.cursor().execute("DELETE FROM analisis"); conn.commit(); st.rerun()
-
-# --- Main ---
-st.title("🚀 HR Intelligence Suite")
-st.markdown("Sistema integral de análisis curricular asistido por IA.")
-
-# --- Pestañas ---
-tab1, tab2, tab3, tab4 = st.tabs(["⚡ Centro de Carga", "📊 Dashboard Ejecutivo", "🗃️ Base de Datos", "📂 Repositorio de Informes"])
-
-# --- TAB 1: Carga ---
-with tab1:
-    # Definiciones
-    FACULTADES = ["Facultad de Ingeniería", "Facultad de Economía y Negocios", "Facultad de Ciencias de la Vida", "Facultad de Educación y Ciencias Sociales"]
-    CARGOS = ["Docente", "Investigador", "Gestión Académica"]
-    
-    col1, col2 = st.columns(2)
-    batches_to_run = []
-
-    def render_batch_ui(column, idx):
-        with column, st.container(border=True):
-            st.subheader(f"📂 Lote #{idx}")
-            files = st.file_uploader(f"Archivos Lote {idx}", accept_multiple_files=True, key=f"u{idx}")
-            fac = st.selectbox("Facultad", FACULTADES, key=f"f{idx}")
-            rol = st.selectbox("Cargo", CARGOS, key=f"r{idx}")
-            
-            if st.button(f"▶ Procesar Lote {idx}", key=f"b{idx}"):
-                if api_key and files:
-                    execute_processing([{'id': f"Lote {idx}", 'files': files, 'fac': fac, 'rol': rol}], api_key, skip_dupes)
-                else: st.warning("Falta API Key o archivos.")
-            
-            return {'id': f"Lote {idx}", 'files': files, 'fac': fac, 'rol': rol}
-
-    b1 = render_batch_ui(col1, 1); b2 = render_batch_ui(col2, 2)
-    b3 = render_batch_ui(col1, 3); b4 = render_batch_ui(col2, 4)
-    
-    st.divider()
-    if st.button("🚀 PROCESAR TODOS LOS LOTES", type="primary", use_container_width=True):
-        active_batches = [b for b in [b1, b2, b3, b4] if b['files']]
-        if api_key and active_batches:
-            execute_processing(active_batches, api_key, skip_dupes)
-        else: st.warning("Falta API Key o no hay archivos.")
-
-# --- TAB 2: Dashboard ---
-with tab2:
-    st.header("📊 Dashboard Ejecutivo")
-    df = db_load_all()
-    if df.empty:
-        st.info("No hay datos para analizar.")
-    else:
-        k1, k2, k3 = st.columns(3)
-        k1.metric("Total", len(df)); k2.metric("Promedio Puntaje", f"{df['puntaje'].mean():.2f}")
-        k3.metric("Aptos (Avanza)", len(df[df['recomendacion'] == 'Avanza']))
+        st.success("Licencia Corporativa Detectada")
         
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("Puntajes por Facultad")
-            fig = px.box(df, x='facultad', y='puntaje', color='facultad'); st.plotly_chart(fig, use_container_width=True)
-        with c2:
-            st.subheader("Distribución de Decisiones")
-            fig2 = px.pie(df, names='recomendacion', hole=0.4); st.plotly_chart(fig2, use_container_width=True)
+    st.divider()
+    
+    # Selección de Modelo (Control del Usuario)
+    st.subheader("Modelo IA")
+    model_choice = st.selectbox(
+        "Versión del Modelo:",
+        ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"],
+        index=0,
+        help="Use Flash para velocidad, Pro para razonamiento complejo."
+    )
+    
+    # Control de Rate Limit
+    req_delay = st.slider("Pausa entre análisis (seg)", 2, 20, 5, help="Aumentar si recibe errores de cuota.")
+    
+    st.divider()
+    skip_dupes = st.checkbox("Omitir Duplicados", value=True)
+    
+    if st.button("🗑️ Resetear Base de Datos"):
+        conn.cursor().execute("DELETE FROM analisis")
+        conn.commit()
+        st.warning("Historial eliminado.")
+        time.sleep(1)
+        st.rerun()
 
-# --- TAB 3: Base de Datos ---
-with tab3:
-    st.header("🗃️ Base de Datos de Análisis (Streaming en Vivo)")
-    st.info("Esta tabla se actualiza en tiempo real durante el procesamiento.")
-    df_db = db_load_all()
-    if df_db.empty:
-        st.info("La base de datos está vacía.")
-    else:
-        st.dataframe(
-            df_db[['timestamp', 'lote_nombre', 'candidato', 'facultad', 'cargo', 'puntaje', 'recomendacion']],
-            column_config={
-                "timestamp": "Fecha y Hora (HH:MM:SS)",
-                "lote_nombre": "Lote",
-                "puntaje": st.column_config.ProgressColumn("Puntaje", format="%.2f", min_value=0, max_value=5)
-            }, use_container_width=True
-        )
+# --- HEADER PRINCIPAL ---
+st.title("🚀 HR Intelligence Suite")
+st.markdown("Plataforma de Análisis Curricular Masivo")
 
-# --- TAB 4: Repositorio ---
-with tab4:
-    st.header("📂 Repositorio de Informes PDF")
-    df_repo = db_load_all()
-    if df_repo.empty:
-        st.info("No hay informes generados.")
+# --- TABS DE NAVEGACIÓN ---
+tab_input, tab_dashboard, tab_data, tab_repo = st.tabs([
+    "📥 Centro de Carga", 
+    "📊 Dashboard Ejecutivo", 
+    "🗃️ Base de Datos en Vivo", 
+    "📂 Repositorio PDF"
+])
+
+# Variables Globales de Interfaz
+FACULTADES = [
+    "Facultad de Ingeniería", 
+    "Facultad de Economía y Negocios", 
+    "Facultad de Ciencias de la Vida", 
+    "Facultad de Educación y Ciencias Sociales"
+]
+CARGOS = ["Docente", "Investigador", "Gestión Académica"]
+
+# ==============================================================================
+# PESTAÑA 1: CENTRO DE CARGA (Input)
+# ==============================================================================
+with tab_input:
+    st.info("Configure los lotes de carga. Puede procesar individualmente o ejecutar un barrido masivo.")
+    
+    c1, c2 = st.columns(2)
+    batches_config = [] # Para almacenar la configuración y ejecutar masivo
+    
+    def render_batch_uploader(col, idx):
+        with col:
+            with st.container(border=True):
+                st.subheader(f"📂 Lote #{idx}")
+                files = st.file_uploader(f"Documentos Lote {idx}", accept_multiple_files=True, key=f"f{idx}")
+                fac = st.selectbox("Facultad", FACULTADES, key=f"fac{idx}")
+                rol = st.selectbox("Cargo", CARGOS, key=f"rol{idx}")
+                
+                # Guardar en lista para proceso masivo
+                if files:
+                    batches_config.append({'id': f"Lote {idx}", 'files': files, 'fac': fac, 'rol': rol})
+                
+                # Botón de Proceso Individual
+                if st.button(f"▶ Procesar Lote {idx}", key=f"btn{idx}"):
+                    if not files or not api_key:
+                        st.error("Faltan archivos o API Key")
+                    else:
+                        run_processing([{'id': f"Lote {idx}", 'files': files, 'fac': fac, 'rol': rol}])
+
+    # Lógica de Ejecución Centralizada
+    def run_processing(batch_list):
+        total_docs = sum(len(b['files']) for b in batch_list)
+        
+        # Alerta de Tiempo
+        est_min = (total_docs * (req_delay + 3)) // 60
+        st.toast(f"Iniciando análisis de {total_docs} documentos. Estimado: {est_min} min.")
+        
+        progress = st.progress(0, "Preparando...")
+        status = st.empty()
+        
+        processed, skipped, errors = 0, 0, 0
+        current_step = 0
+        
+        for b in batch_list:
+            for f in b['files']:
+                current_step += 1
+                status.text(f"Procesando {current_step}/{total_docs}: {f.name} ({b['id']})")
+                
+                # 1. Hash & Check
+                f.seek(0); f_bytes = f.read(); f_hash = get_file_hash(f_bytes)
+                
+                if skip_dupes and db_check_exists(f_hash):
+                    skipped += 1
+                else:
+                    # 2. Leer & Analizar
+                    f.seek(0)
+                    txt = read_file_safe(f)
+                    if len(txt) > 50:
+                        res = analyze_with_gemini(txt, b['rol'], b['fac'], api_key, model_choice)
+                        if res:
+                            # 3. Guardar
+                            res.update({'facultad': b['fac'], 'cargo': b['rol']})
+                            pdf = generate_pdf_report(res)
+                            db_save_record(res, pdf, f_hash, f.name, b['id'])
+                            processed += 1
+                            time.sleep(req_delay) # Rate Limit
+                        else:
+                            errors += 1
+                    else:
+                        errors += 1
+                
+                progress.progress(current_step / total_docs)
+        
+        status.success(f"Finalizado: {processed} Procesados | {skipped} Duplicados | {errors} Errores")
+        time.sleep(2)
+        st.rerun()
+
+    # Renderizado de la UI de Lotes
+    render_batch_uploader(c1, 1); render_batch_uploader(c2, 2)
+    render_batch_uploader(c1, 3); render_batch_uploader(c2, 4)
+    
+    st.markdown("---")
+    if st.button("🚀 PROCESAR TODOS LOS LOTES ACTIVOS", type="primary", use_container_width=True):
+        if not api_key: st.error("Falta API Key")
+        elif not batches_config: st.warning("No hay archivos cargados en ningún lote")
+        else: run_processing(batches_config)
+
+# ==============================================================================
+# PESTAÑA 2: DASHBOARD EJECUTIVO
+# ==============================================================================
+with tab_dashboard:
+    st.header("📊 Tablero de Control")
+    df = db_load_all()
+    
+    if df.empty:
+        st.info("No hay datos históricos. Procese archivos para visualizar métricas.")
     else:
-        c1, c2 = st.columns([1,2])
-        zip_mem = io.BytesIO()
-        with zipfile.ZipFile(zip_mem, "w") as zf:
-            for i, row in df_repo.iterrows():
-                if row['pdf_blob']: zf.writestr(f"{row['candidato']}.pdf", row['pdf_blob'])
-        c1.download_button("📦 Descargar Todos (ZIP)", zip_mem.getvalue(), "Informes.zip", type="primary")
-        c2.download_button("💾 Descargar Excel", df_repo.drop(columns=['pdf_blob', 'raw_json']).to_csv(index=False).encode('utf-8'), "data.csv")
+        # KPIs
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Total Procesado", len(df))
+        k2.metric("Puntaje Promedio", f"{df['puntaje'].mean():.2f}")
+        k3.metric("Tasa de Aprobación", f"{(len(df[df['recomendacion']=='AVANZA']) / len(df) * 100):.1f}%")
         
         st.divider()
-        for i, row in df_repo.iterrows():
-            with st.expander(f"📄 {row['candidato']} - {row['cargo']} ({row['puntaje']})"):
-                cols = st.columns([4, 1])
-                cols[0].write(f"**Recomendación:** {row['recomendacion']}"); cols[0].caption(f"Procesado el {row['timestamp']}")
-                if row['pdf_blob']: cols[1].download_button("Descargar", row['pdf_blob'], f"{row['candidato']}.pdf", key=f"dl_{i}")
+        
+        # Gráficos
+        g1, g2 = st.columns(2)
+        with g1:
+            st.subheader("Distribución por Facultad")
+            fig_box = px.box(df, x="facultad", y="puntaje", color="facultad", points="all")
+            st.plotly_chart(fig_box, use_container_width=True)
+            
+        with g2:
+            st.subheader("Decisiones")
+            fig_pie = px.pie(df, names="recomendacion", hole=0.4, color="recomendacion",
+                             color_discrete_map={"AVANZA":"#2ecc71", "NO RECOMENDADO":"#e74c3c", "REQUIERE ANTECEDENTES":"#f1c40f"})
+            st.plotly_chart(fig_pie, use_container_width=True)
+            
+        st.subheader("🏆 Ranking Top Talent")
+        st.dataframe(
+            df[df['puntaje'] >= 3.75].sort_values(by="puntaje", ascending=False)[['candidato', 'puntaje', 'facultad', 'cargo']],
+            use_container_width=True,
+            hide_index=True
+        )
+
+# ==============================================================================
+# PESTAÑA 3: BASE DE DATOS (DATA GRID)
+# ==============================================================================
+with tab_data:
+    st.header("🗃️ Registro Detallado")
+    st.caption("Visualización en tiempo real de los registros almacenados.")
+    
+    df_grid = db_load_all()
+    if df_grid.empty:
+        st.warning("Base de datos vacía.")
+    else:
+        # Configuración de Columnas para UX
+        st.dataframe(
+            df_grid[['timestamp', 'lote_nombre', 'candidato', 'facultad', 'cargo', 'puntaje', 'recomendacion']],
+            column_config={
+                "timestamp": st.column_config.DatetimeColumn("Fecha/Hora", format="DD/MM HH:mm:ss"),
+                "puntaje": st.column_config.ProgressColumn("Puntaje", min_value=0, max_value=5, format="%.2f"),
+                "lote_nombre": "Lote Origen"
+            },
+            use_container_width=True,
+            height=600
+        )
+        
+        st.download_button(
+            "💾 Descargar Tabla Completa (Excel)",
+            data=df_grid.drop(columns=['pdf_blob', 'raw_json']).to_csv(index=False).encode('utf-8'),
+            file_name="Reporte_Consolidado.csv",
+            mime="text/csv"
+        )
+
+# ==============================================================================
+# PESTAÑA 4: REPOSITORIO PDF
+# ==============================================================================
+with tab_repo:
+    st.header("📂 Gestión Documental")
+    df_repo = db_load_all()
+    
+    if df_repo.empty:
+        st.info("Sin informes generados.")
+    else:
+        # ZIP Generator
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            for idx, row in df_repo.iterrows():
+                if row['pdf_blob']:
+                    fname = f"{re.sub(r'[^a-zA-Z0-9]', '_', str(row['candidato']))}_{row['lote_nombre']}.pdf"
+                    zf.writestr(fname, row['pdf_blob'])
+        
+        st.download_button(
+            "📦 Descargar Todos los Informes (ZIP)",
+            data=zip_buffer.getvalue(),
+            file_name="Informes_Completos.zip",
+            mime="application/zip",
+            type="primary"
+        )
+        
+        st.divider()
+        st.write("Descarga Individual:")
+        
+        for idx, row in df_repo.iterrows():
+            with st.expander(f"{row['candidato']} - {row['puntaje']:.2f}"):
+                c_info, c_btn = st.columns([3, 1])
+                c_info.write(f"**Cargo:** {row['cargo']} | **Estado:** {row['recomendacion']}")
+                if row['pdf_blob']:
+                    c_btn.download_button("Descargar PDF", row['pdf_blob'], f"Informe_{row['candidato']}.pdf", key=f"pdf_{idx}")
