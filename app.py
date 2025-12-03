@@ -31,11 +31,14 @@ st.markdown("""
     .stTabs [data-baseweb="tab-list"] { gap: 10px; }
     .stTabs [data-baseweb="tab"] { height: 50px; }
     div[data-testid="stExpander"] { border: 1px solid #4a4a4a; border-radius: 5px; }
+    
+    /* Ajuste para botón de limpiar pequeño */
+    .small-btn { margin-top: 0px; }
     </style>
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# 2. GESTIÓN DE API Y MODELOS (AUTODESCUBRIMIENTO)
+# 2. GESTIÓN DE API Y MODELOS
 # ==============================================================================
 
 def get_api_key():
@@ -52,24 +55,23 @@ def get_available_models(api_key):
             if 'generateContent' in m.supported_generation_methods:
                 name = m.name.replace('models/', '')
                 model_list.append(name)
-        # Ordenar: Flash primero
         model_list.sort(key=lambda x: 'flash' not in x.lower())
         return model_list
     except:
         return ["gemini-1.5-flash"]
 
 # ==============================================================================
-# 3. BASE DE DATOS (PERSISTENCIA)
+# 3. BASE DE DATOS
 # ==============================================================================
 
 @st.cache_resource
 def init_db():
-    conn = sqlite3.connect('cv_master_db.db', check_same_thread=False)
+    conn = sqlite3.connect('cv_final_db_v4.db', check_same_thread=False)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS analisis (
                     file_hash TEXT PRIMARY KEY, timestamp TEXT, lote_nombre TEXT, archivo_nombre TEXT,
                     candidato TEXT, facultad TEXT, cargo TEXT, puntaje REAL, recomendacion TEXT,
-                    ajuste TEXT, raw_json TEXT, pdf_blob BLOB
+                    ajuste TEXT, comentarios TEXT, raw_json TEXT, pdf_blob BLOB
                 )''')
     conn.commit()
     return conn
@@ -90,12 +92,15 @@ def db_save_record(data_dict, pdf_bytes, file_hash, filename, lote_name):
     json_str = json.dumps(data_dict, ensure_ascii=False)
     puntaje = float(data_dict.get('puntaje_global', 0.0))
     
-    c.execute('''INSERT OR REPLACE INTO analisis VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+    # Extraemos el resumen ejecutivo para la tabla
+    comentarios = data_dict.get('conclusion_ejecutiva', 'Sin comentarios')
+    
+    c.execute('''INSERT OR REPLACE INTO analisis VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
               (file_hash, now, lote_name, filename, 
                data_dict.get('nombre', 'Desconocido'),
                data_dict.get('facultad', ''), data_dict.get('cargo', ''),
                puntaje, data_dict.get('recomendacion', 'N/A'),
-               data_dict.get('ajuste', 'N/A'), json_str, pdf_bytes))
+               data_dict.get('ajuste', 'N/A'), comentarios, json_str, pdf_bytes))
     conn.commit()
 
 def db_load_all():
@@ -131,16 +136,16 @@ def analyze_with_gemini(text, role, faculty, api_key, model_choice):
     4. Software (15%)
     
     REGLAS:
-    - Puntaje Global: 0.00 a 5.00
+    - Puntaje Global: 0.00 a 5.00 (Dos decimales)
     - Recomendación: "AVANZA" (>=3.75), "REQUIERE ANTECEDENTES" (3.00-3.74), "NO RECOMENDADO" (<3.00)
     
-    OUTPUT JSON:
+    OUTPUT JSON (Estricto):
     {{
         "nombre": "Nombre Apellido",
         "ajuste": "ALTO/MEDIO/BAJO",
         "puntaje_global": 0.00,
         "recomendacion": "ESTADO",
-        "conclusion_ejecutiva": "Resumen.",
+        "conclusion_ejecutiva": "Resumen breve de maximo 40 palabras.",
         "detalle_puntajes": {{
             "formacion": {{ "nota": 0, "ponderado": 0.00 }},
             "experiencia": {{ "nota": 0, "ponderado": 0.00 }},
@@ -166,7 +171,7 @@ def analyze_with_gemini(text, role, faculty, api_key, model_choice):
         return None
 
 # ==============================================================================
-# 5. GENERADOR PDF (CORREGIDO - ERROR SPACE)
+# 5. GENERADOR PDF
 # ==============================================================================
 
 class PDFReport(FPDF):
@@ -178,10 +183,8 @@ class PDFReport(FPDF):
 def generate_pdf_report(data):
     pdf = PDFReport()
     pdf.add_page()
-    # Helper de encoding robusto
     def txt(s): return str(s).encode('latin-1', 'replace').decode('latin-1')
     
-    # Datos Generales
     pdf.set_font('Arial', 'B', 11); pdf.cell(30, 6, "Candidato:", 0, 0); pdf.set_font('Arial', '', 11)
     pdf.cell(0, 6, txt(data.get('nombre', 'N/A')), 0, 1)
     pdf.set_font('Arial', 'B', 11); pdf.cell(30, 6, "Cargo:", 0, 0); pdf.set_font('Arial', '', 11)
@@ -216,6 +219,9 @@ def generate_pdf_report(data):
     for n, p, v in dims:
         pdf.ln(8); pdf.cell(80, 8, txt(n), 1); pdf.cell(30, 8, p, 1, 0, 'C')
         pdf.cell(30, 8, str(v.get('nota', 0)), 1, 0, 'C'); pdf.cell(50, 8, f"{v.get('ponderado', 0):.2f}", 1, 0, 'C')
+    pdf.ln(8)
+    pdf.set_fill_color(230,230,230); pdf.set_font('Arial', 'B', 9)
+    pdf.cell(140, 8, "TOTAL PONDERADO", 1, 0, 'R', True); pdf.cell(50, 8, f"{data.get('puntaje_global', 0):.2f}", 1, 1, 'C', True)
     pdf.ln(10)
     
     # Cualitativo
@@ -225,17 +231,11 @@ def generate_pdf_report(data):
     
     cual = data.get('analisis_cualitativo', {})
     for k, v in cual.items():
-        pdf.set_font('Arial', 'B', 10); pdf.cell(0, 6, txt(k.capitalize()), 0, 1)
-        pdf.set_font('Arial', '', 10)
+        pdf.set_font('Arial', 'B', 10); pdf.cell(0, 6, txt(k.capitalize()), 0, 1); pdf.set_font('Arial', '', 10)
         items = v if isinstance(v, list) else [str(v)]
-        
-        # --- CORRECCIÓN DE ERROR FPDFException: Not enough horizontal space ---
-        for i in items:
-            # Aseguramos que el cursor esté en el margen izquierdo
+        for i in items: 
             pdf.set_x(10)
-            # Forzamos un ancho explícito (190mm) para evitar error w=0
             pdf.multi_cell(190, 5, txt(f"- {i}"))
-        
         pdf.ln(2)
     
     return bytes(pdf.output())
@@ -247,9 +247,14 @@ def generate_pdf_report(data):
 def execute_processing(batches, api_key, model_choice, skip_dupes, delay_sec):
     total_files = sum(len(b['files']) for b in batches)
     
+    # AVISO DE TIEMPO (REQUERIMIENTO CLAVE)
+    est_time_min = (total_files * (delay_sec + 5)) / 60
+    st.info(f"⏱️ **Estimación:** Se procesarán {total_files} documentos. Tiempo aprox: {est_time_min:.1f} minutos. Por favor espere...")
+    
     # UI Containers
-    progress_bar = st.progress(0, "Iniciando...")
+    progress_bar = st.progress(0, "Iniciando motor de análisis...")
     status = st.empty()
+    st.subheader("📋 Datos en Vivo (Streaming)")
     live_table = st.empty()
     
     processed, skipped, errors = 0, 0, 0
@@ -258,7 +263,7 @@ def execute_processing(batches, api_key, model_choice, skip_dupes, delay_sec):
     for batch in batches:
         for file in batch['files']:
             current_idx += 1
-            status.text(f"Procesando {current_idx}/{total_files}: {file.name}...")
+            status.text(f"Analizando {current_idx}/{total_files}: {file.name} ({batch['id']})...")
             
             # 1. Duplicidad
             file.seek(0); f_bytes = file.read(); f_hash = get_file_hash(f_bytes)
@@ -279,20 +284,35 @@ def execute_processing(batches, api_key, model_choice, skip_dupes, delay_sec):
                     else: errors += 1
                 else: errors += 1
                 
-                # 3. Freno de mano (Rate Limit)
+                # 3. Rate Limit
                 time.sleep(delay_sec)
             
             # 4. Actualizar UI
             progress_bar.progress(current_idx / total_files)
             
-            if current_idx % 1 == 0:
-                with live_table.container():
-                    df = db_load_all()
-                    if not df.empty:
-                        st.dataframe(df.head(5)[['timestamp', 'candidato', 'puntaje', 'recomendacion']], use_container_width=True)
+            # STREAMING EN VIVO DE LA TABLA COMPLETA
+            with live_table.container():
+                df = db_load_all()
+                if not df.empty:
+                    st.dataframe(
+                        df[['timestamp', 'lote_nombre', 'candidato', 'puntaje', 'recomendacion', 'comentarios']],
+                        column_config={
+                            "timestamp": st.column_config.DatetimeColumn("Hora", format="HH:mm:ss"),
+                            "puntaje": st.column_config.ProgressColumn("Puntaje", format="%.2f", min_value=0, max_value=5),
+                            "comentarios": st.column_config.TextColumn("Resumen Ejecutivo", width="large")
+                        },
+                        use_container_width=True,
+                        hide_index=True
+                    )
 
     status.success(f"Finalizado. Nuevos: {processed} | Saltados: {skipped} | Errores: {errors}")
     time.sleep(2)
+    st.rerun()
+
+#Función helper para limpiar lote
+def clear_batch_state(key):
+    if key in st.session_state:
+        del st.session_state[key]
     st.rerun()
 
 # ==============================================================================
@@ -307,7 +327,7 @@ with st.sidebar:
     if is_corporate:
         st.success("✅ Licencia Corporativa Activa")
     else:
-        user_input = st.text_input("Google API Key", type="password", help="Ingrese su clave si no tiene licencia corporativa.")
+        user_input = st.text_input("Google API Key", type="password")
         if user_input:
             st.session_state['user_api_key'] = user_input
             api_key = user_input
@@ -315,17 +335,16 @@ with st.sidebar:
 
     st.divider()
     
-    # Selector de Modelo (Dinámico)
     st.subheader("🧠 Modelo de IA")
     if api_key:
         available_models = get_available_models(api_key)
         if available_models:
             model_choice = st.selectbox("Modelo Detectado:", available_models, index=0)
         else:
-            st.error("Error al cargar modelos. Revise la API Key.")
+            st.error("Error al cargar modelos.")
             model_choice = None
     else:
-        st.warning("Ingrese API Key para ver modelos.")
+        st.warning("Ingrese API Key.")
         model_choice = None
         
     delay = st.slider("Pausa entre análisis (seg)", 2, 20, 5)
@@ -344,14 +363,19 @@ CARGOS = ["Docente", "Investigador", "Gestión Académica"]
 
 # --- TAB 1: Carga ---
 with tab1:
-    col_a, col_b = st.columns(2)
+    c1, c2 = st.columns(2)
     batches_data = []
     
     def render_batch(col, idx):
         with col, st.container(border=True):
-            st.subheader(f"📂 Lote #{idx}")
-            files = st.file_uploader(f"Docs {idx}", accept_multiple_files=True, key=f"u{idx}")
-            fac = st.selectbox("Facultad", FACULTADES, key=f"fac{idx}")
+            # Header con Botón de Limpiar
+            sub_c1, sub_c2 = st.columns([4, 1])
+            sub_c1.subheader(f"📂 Lote #{idx}")
+            if sub_c2.button("🗑️", key=f"clr{idx}", help="Limpiar archivos de este lote"):
+                clear_batch_state(f"u{idx}")
+
+            files = st.file_uploader(f"Docs {idx}", accept_multiple_files=True, key=f"u{idx}", label_visibility="collapsed")
+            fac = st.selectbox("Facultad", FACULTADES, key=f"f{idx}")
             rol = st.selectbox("Cargo", CARGOS, key=f"r{idx}")
             
             if st.button(f"▶ Procesar Lote {idx}", key=f"b{idx}"):
@@ -361,8 +385,8 @@ with tab1:
             
             if files: batches_data.append({'id': f"Lote {idx}", 'files': files, 'fac': fac, 'rol': rol})
 
-    render_batch(col_a, 1); render_batch(col_b, 2)
-    render_batch(col_a, 3); render_batch(col_b, 4)
+    render_batch(c1, 1); render_batch(c2, 2)
+    render_batch(c1, 3); render_batch(c2, 4)
     
     st.markdown("---")
     if st.button("🚀 PROCESAR TODO", type="primary", use_container_width=True):
@@ -386,10 +410,19 @@ with tab2:
 
 # --- TAB 3: DATOS ---
 with tab3:
-    st.header("🗃️ Base de Datos")
+    st.header("🗃️ Base de Datos Completa")
     df = db_load_all()
     if not df.empty:
-        st.dataframe(df[['timestamp', 'lote_nombre', 'candidato', 'puntaje', 'recomendacion']], use_container_width=True)
+        st.dataframe(
+            df[['timestamp', 'lote_nombre', 'candidato', 'puntaje', 'recomendacion', 'comentarios']],
+            column_config={
+                "timestamp": st.column_config.DatetimeColumn("Hora", format="HH:mm:ss"),
+                "puntaje": st.column_config.ProgressColumn("Puntaje", format="%.2f", min_value=0, max_value=5),
+                "comentarios": st.column_config.TextColumn("Resumen Ejecutivo", width="large")
+            },
+            use_container_width=True,
+            hide_index=True
+        )
         st.download_button("Descargar Excel", df.drop(columns=['pdf_blob', 'raw_json']).to_csv(index=False).encode('utf-8'), "data.csv")
     else: st.info("Vacía.")
 
